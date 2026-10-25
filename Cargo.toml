@@ -1,0 +1,77 @@
+[package]
+name = "oxzstd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Zstandard (RFC 8878) compression and decompression in safe Rust, with no dependencies"
+license = "MIT"
+repository = "https://github.com/dburman/oxzstd"
+publish = false
+
+# Its own workspace, also when checked out inside another one (as a submodule, say).
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+let_underscore_drop = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+# A codec indexes tables and buffers on every byte. Indexing is bounds-checked (memory-safe);
+# a panic is still a bug, and the fuzz targets and tests hunt for them. `get()` everywhere
+# would cost a branch per access and hide the real invariant.
+indexing_slicing = "allow"
+# Bit fields, table sizes and lengths move between u8/u16/u32/usize constantly; each cast is
+# within the format's limits.
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Cost estimates are in f64; the counts they come from are far below 2^52.
+cast_precision_loss = "allow"
+# Codec code names things after the format (ll, ml, of, rep1, rep2) and the parameter table
+# after its columns.
+similar_names = "allow"
+many_single_char_names = "allow"
+# The bit reads and table lookups of the decoding loops are marked inline(always): with plain
+# #[inline] the compiler leaves some out of line and decompression is about 17% slower.
+inline_always = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+string_slice = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+mem_forget = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+exit = "warn"
+allow_attributes_without_reason = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Overflow checks off in release, as in std: lengths are validated where they come in, and a
+# check on every arithmetic step of the hot loops costs measurable speed.
+overflow-checks = false
+panic = "unwind"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[[bench]]
+name = "versus_zstd"
+harness = false

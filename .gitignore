@@ -1,0 +1,6 @@
+/target
+**/*.bak
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/bench-data
