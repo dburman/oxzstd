@@ -1,19 +1,19 @@
 //! A compressed block's body: the literals section and the sequences section (RFC 8878
 //! §3.1.1.3), with each table's mode chosen by estimated size.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
-use super::seq::{Seq, SeqStore, ll_code, ml_code, of_code};
+use super::seq::{Seq, SeqStore, ll_code_bits, ml_code_bits, of_code};
 use crate::bitwriter::BitWriter;
-use crate::decode::{LL_CODES, ML_CODES};
 use crate::fse;
-use crate::fse_enc::{self, EncodeTable, TableView};
+use crate::fse_enc::{self, EncodeTable, Norm, TableView};
 use crate::huf_enc::{self, Code};
 
 /// A sequence table as the decoder will hold it after a block, for the repeat mode.
 #[derive(Clone, Debug)]
 pub(crate) enum Prior {
-    Table { norm: Vec<i16>, log: u32 },
+    Table { norm: Norm, log: u32 },
     Rle(u8),
 }
 
@@ -102,7 +102,8 @@ pub(crate) fn literals(lits: &[u8], seqs: usize, entropy: &mut Entropy, out: &mu
         return;
     }
     let four = lits.len() >= 256;
-    let mut body = Vec::with_capacity(lits.len());
+    // Room for the streams as they're written (each in the worst case, 11 bits a literal).
+    let mut body = Vec::with_capacity(description.len() + lits.len() * 11 / 8 + 64);
     let used = if treeless {
         entropy.huffman.clone()
     } else {
@@ -169,7 +170,8 @@ fn rle_or_raw_header(kind: u8, len: usize, out: &mut Vec<u8>) {
 /// One stream's choice: the mode bits, the table to encode with, and its description.
 struct Choice {
     mode: u8,
-    table: EncodeTable,
+    /// The predefined tables are shared, not copied.
+    table: Cow<'static, EncodeTable>,
     description: Vec<u8>,
     prior: Prior,
 }
@@ -178,11 +180,11 @@ struct Choice {
 enum Pick {
     Predefined,
     Repeat,
-    Fresh { norm: Vec<i16>, log: u32 },
+    Fresh { norm: Norm, log: u32 },
 }
 
 /// The predefined table for `default`, built once.
-fn predefined(default: (&[i16], u32)) -> EncodeTable {
+fn predefined(default: (&[i16], u32)) -> &'static EncodeTable {
     static TABLES: [OnceLock<EncodeTable>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
     // The three predefined distributions differ in length.
     let i = match default.0.len() {
@@ -190,9 +192,7 @@ fn predefined(default: (&[i16], u32)) -> EncodeTable {
         29 => 1,
         _ => 2,
     };
-    TABLES[i]
-        .get_or_init(|| EncodeTable::new(default.0, default.1))
-        .clone()
+    TABLES[i].get_or_init(|| EncodeTable::new(default.0, default.1))
 }
 
 /// Picks the cheapest mode for one stream's codes. Each candidate is priced first, and only
@@ -208,7 +208,7 @@ fn choose(
     let used = counts.iter().filter(|&&c| c > 0).count();
     let rle = |mode| Choice {
         mode,
-        table: EncodeTable::rle(max as u8),
+        table: Cow::Owned(EncodeTable::rle(max as u8)),
         description: if mode == 1 {
             vec![max as u8]
         } else {
@@ -253,10 +253,10 @@ fn choose(
     match best.map(|(_, pick)| pick) {
         Some(Pick::Predefined) => Choice {
             mode: 0,
-            table: predefined(default),
+            table: Cow::Borrowed(predefined(default)),
             description: Vec::new(),
             prior: Prior::Table {
-                norm: default.0.to_vec(),
+                norm: Norm::new(default.0),
                 log: default.1,
             },
         },
@@ -266,17 +266,17 @@ fn choose(
             };
             Choice {
                 mode: 3,
-                table: EncodeTable::new(norm, *log),
+                table: Cow::Owned(EncodeTable::new(norm, *log)),
                 description: Vec::new(),
                 prior: Prior::Table {
-                    norm: norm.clone(),
+                    norm: *norm,
                     log: *log,
                 },
             }
         }
         Some(Pick::Fresh { norm, log }) => Choice {
             mode: 2,
-            table: EncodeTable::new(&norm, log),
+            table: Cow::Owned(EncodeTable::new(&norm, log)),
             description,
             prior: Prior::Table { norm, log },
         },
@@ -285,8 +285,19 @@ fn choose(
     }
 }
 
+/// Buffers the sequences section needs, kept from block to block.
+#[derive(Debug, Default)]
+pub(crate) struct Scratch {
+    coded: Vec<Coded>,
+}
+
 /// Writes the sequences section for `seqs`, updating the tables in `entropy`.
-pub(crate) fn sequences(seqs: &[Seq], entropy: &mut Entropy, out: &mut Vec<u8>) {
+pub(crate) fn sequences(
+    seqs: &[Seq],
+    entropy: &mut Entropy,
+    scratch: &mut Scratch,
+    out: &mut Vec<u8>,
+) {
     let n = seqs.len();
     if n < 128 {
         out.push(n as u8);
@@ -300,21 +311,10 @@ pub(crate) fn sequences(seqs: &[Seq], entropy: &mut Entropy, out: &mut Vec<u8>) 
     if n == 0 {
         return;
     }
-    let mut codes = Vec::with_capacity(n);
-    let mut ll_counts = [0u32; 36];
-    let mut of_counts = [0u32; 32];
-    let mut ml_counts = [0u32; 53];
-    for s in seqs {
-        let c = (
-            ll_code(s.lit_len),
-            of_code(s.off_value),
-            ml_code(s.match_len),
-        );
-        ll_counts[c.0 as usize] += 1;
-        of_counts[c.1 as usize] += 1;
-        ml_counts[c.2 as usize] += 1;
-        codes.push(c);
-    }
+    let coded = &mut scratch.coded;
+    coded.clear();
+    coded.extend(seqs.iter().map(Coded::new));
+    let (ll_counts, of_counts, ml_counts) = count_codes(coded);
     let ll = choose(&ll_counts, n, (&fse::LL_DEFAULT, 6), 9, entropy.ll.as_ref());
     let of = choose(&of_counts, n, (&fse::OF_DEFAULT, 5), 8, entropy.of.as_ref());
     let ml = choose(&ml_counts, n, (&fse::ML_DEFAULT, 6), 9, entropy.ml.as_ref());
@@ -325,92 +325,144 @@ pub(crate) fn sequences(seqs: &[Seq], entropy: &mut Entropy, out: &mut Vec<u8>) 
 
     // A sequence takes at most 26 bits of states and 63 of extra bits: 12 bytes. The loop in
     // `encode_sequences` writes into exactly this, with 8 bytes to spare for its last flush.
-    let mut w = BitWriter::with_capacity(n * 12 + 8);
-    let last = n - 1;
-    let ml_state = ml.table.init(codes[last].2);
-    let of_state = of.table.init(codes[last].1);
-    let ll_state = ll.table.init(codes[last].0);
-    let (lle, mle, ofe) = extra_bits(&seqs[last], codes[last]);
-    w.add(lle.0, lle.1);
-    w.add(mle.0, mle.1);
-    w.add(ofe.0, ofe.1);
+    let mut w = BitWriter::appending(std::mem::take(out), n * 12 + 8);
+    let last = coded[n - 1];
+    let ml_state = ml.table.init(last.ml);
+    let of_state = of.table.init(last.of);
+    let ll_state = ll.table.init(last.ll);
+    let lengths = u32::from(last.lengths);
+    w.add(last.extra & ((1 << lengths) - 1), lengths);
+    w.add(last.extra >> lengths, u32::from(last.of));
     w.flush();
     let views = [of.table.view(), ml.table.view(), ll.table.view()];
-    let (mut w, [of_state, ml_state, ll_state]) = encode_sequences(
-        w,
-        &codes[..last],
-        &seqs[..last],
-        views,
-        [of_state, ml_state, ll_state],
-    );
+    let (mut w, [of_state, ml_state, ll_state]) =
+        encode_sequences(w, &coded[..n - 1], views, [of_state, ml_state, ll_state]);
     ml.table.flush(&mut w, ml_state);
     of.table.flush(&mut w, of_state);
     ll.table.flush(&mut w, ll_state);
-    out.extend_from_slice(&w.finish_backward());
+    *out = w.finish_backward();
     entropy.ll = Some(ll.prior);
     entropy.of = Some(of.prior);
     entropy.ml = Some(ml.prior);
 }
 
-/// Encodes `seqs` (with their codes) last to first, from the states `[of, ml, ll]`; returns
-/// the writer and the states after. A function of its own, taking the writer by value, so
-/// the writer, the states and the tables all stay in registers.
+/// A sequence as the encoding loop takes it: its three codes, and its extra bits already put
+/// together, in the order they're written (literal length, match length, offset).
+#[derive(Clone, Copy, Debug)]
+struct Coded {
+    extra: u64,
+    /// How many extra bits there are, and how many of them are the lengths'.
+    bits: u8,
+    lengths: u8,
+    ll: u8,
+    of: u8,
+    ml: u8,
+}
+
+impl Coded {
+    #[inline(always)]
+    fn new(s: &Seq) -> Self {
+        let (ll, ll_bits) = ll_code_bits(s.lit_len);
+        let (ml, ml_bits) = ml_code_bits(s.match_len);
+        let of = of_code(s.off_value);
+        let low = |value: u32, bits: u8| u64::from(value & ((1 << bits) - 1));
+        // At most 16 + 16 + 31 bits.
+        let lengths = ll_bits + ml_bits;
+        let extra = low(s.lit_len, ll_bits)
+            | low(s.match_len - 3, ml_bits) << ll_bits
+            | low(s.off_value, of) << lengths;
+        Self {
+            extra,
+            bits: lengths + of,
+            lengths,
+            ll,
+            of,
+            ml,
+        }
+    }
+}
+
+/// How often each literal-length, offset and match-length code occurs in `coded`. Counted
+/// into four sets of tables in turn, so that a run of one code doesn't make each increment
+/// wait on the one before it.
+fn count_codes(coded: &[Coded]) -> ([u32; 36], [u32; 32], [u32; 53]) {
+    // Each set: literal lengths at 0, offsets at 64, match lengths at 128. The masks only say
+    // what's already so (the codes are in range), and spare the bounds checks.
+    let mut sets = [[0u32; 192]; 4];
+    let mut add = |set: usize, c: &Coded| {
+        let t = &mut sets[set];
+        t[c.ll as usize & 63] += 1;
+        t[64 + (c.of as usize & 63)] += 1;
+        t[128 + (c.ml as usize & 63)] += 1;
+    };
+    let (quads, rest) = coded.as_chunks::<4>();
+    for q in quads {
+        for (set, c) in q.iter().enumerate() {
+            add(set, c);
+        }
+    }
+    for c in rest {
+        add(0, c);
+    }
+    let total = |at: usize, i: usize| sets.iter().map(|t| t[at + i]).sum::<u32>();
+    (
+        std::array::from_fn(|i| total(0, i)),
+        std::array::from_fn(|i| total(64, i)),
+        std::array::from_fn(|i| total(128, i)),
+    )
+}
+
+/// Encodes `coded` last to first, from the states `[of, ml, ll]`; returns the writer and the
+/// states after. A function of its own, taking the writer by value, so the writer, the
+/// states and the tables all stay in registers.
 #[inline(never)]
 fn encode_sequences(
     w: BitWriter,
-    codes: &[(u8, u8, u8)],
-    seqs: &[Seq],
+    coded: &[Coded],
     [of_view, ml_view, ll_view]: [TableView<'_>; 3],
     [mut of_state, mut ml_state, mut ll_state]: [u32; 3],
 ) -> (BitWriter, [u32; 3]) {
     let (mut out, mut w) = w.split();
     // Sized for the worst case (see `sequences`), so the loop never grows it.
     let buf = out.as_mut_slice();
-    for (s, &c) in seqs.iter().zip(codes).rev() {
+    for c in coded.iter().rev() {
         // At most 7 bits are held after a flush; the states add up to 26 (8 + 9 + 9), the
         // extra bits up to 63, so flush between them as needed to stay within 64.
-        of_view.encode(&mut w, &mut of_state, c.1);
-        ml_view.encode(&mut w, &mut ml_state, c.2);
-        ll_view.encode(&mut w, &mut ll_state, c.0);
-        let (lle, mle, ofe) = extra_bits(s, c);
-        let bits = lle.1 + mle.1 + ofe.1;
+        of_view.encode(&mut w, &mut of_state, c.of);
+        ml_view.encode(&mut w, &mut ml_state, c.ml);
+        ll_view.encode(&mut w, &mut ll_state, c.ll);
+        let bits = u32::from(c.bits);
         if bits >= 64 - 7 - 26 {
             w.flush_into(buf);
         }
-        w.add_fast(lle.0, lle.1);
-        w.add_fast(mle.0, mle.1);
         if bits > 56 {
+            let lengths = u32::from(c.lengths);
+            w.add_fast(c.extra & ((1 << lengths) - 1), lengths);
             w.flush_into(buf);
+            w.add_fast(c.extra >> lengths, u32::from(c.of));
+        } else {
+            w.add_fast(c.extra, bits);
         }
-        w.add_fast(ofe.0, ofe.1);
         w.flush_into(buf);
     }
     (BitWriter::join(out, w), [of_state, ml_state, ll_state])
 }
 
-/// A sequence's extra bits for its literal length, match length and offset: values and
-/// counts.
-#[inline(always)]
-fn extra_bits(s: &Seq, c: (u8, u8, u8)) -> ((u64, u32), (u64, u32), (u64, u32)) {
-    let (ll_base, ll_bits) = LL_CODES[c.0 as usize];
-    let (ml_base, ml_bits) = ML_CODES[c.2 as usize];
-    (
-        (u64::from(s.lit_len - ll_base), u32::from(ll_bits)),
-        (u64::from(s.match_len - ml_base), u32::from(ml_bits)),
-        (u64::from(s.off_value - (1 << c.1)), u32::from(c.1)),
-    )
-}
-
-/// The body of a compressed block for `store`, and the entropy state after it. With
-/// `raw_literals` the literals are stored as they are.
-pub(crate) fn body(store: &SeqStore, entropy: &Entropy, raw_literals: bool) -> (Vec<u8>, Entropy) {
+/// Writes the body of a compressed block for `store` onto `out`; returns the entropy state
+/// after it. With `raw_literals` the literals are stored as they are.
+pub(crate) fn body(
+    store: &SeqStore,
+    entropy: &Entropy,
+    raw_literals: bool,
+    scratch: &mut Scratch,
+    out: &mut Vec<u8>,
+) -> Entropy {
     let mut next = entropy.clone();
-    let mut out = Vec::with_capacity(store.lits().len() / 2 + store.seqs().len() * 3 + 16);
     if raw_literals {
-        raw(store.lits(), &mut out);
+        raw(store.lits(), out);
     } else {
-        literals(store.lits(), store.seqs().len(), &mut next, &mut out);
+        literals(store.lits(), store.seqs().len(), &mut next, out);
     }
-    sequences(store.seqs(), &mut next, &mut out);
-    (out, next)
+    sequences(store.seqs(), &mut next, scratch, out);
+    next
 }

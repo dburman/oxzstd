@@ -11,7 +11,7 @@ mod opt;
 pub(crate) mod params;
 mod seq;
 
-use block::Entropy;
+use block::{Entropy, Scratch};
 use dfast::DoubleFast;
 use dubt::Dubt;
 use fast::Fast;
@@ -126,8 +126,13 @@ fn frame_header(size: Option<u64>, window_log: u32, checksum: bool, out: &mut Ve
 }
 
 fn block_header(last: bool, kind: u32, size: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(&header_bytes(last, kind, size));
+}
+
+fn header_bytes(last: bool, kind: u32, size: usize) -> [u8; 3] {
     let h = u32::from(last) | (kind << 1) | ((size as u32) << 3);
-    out.extend_from_slice(&h.to_le_bytes()[..3]);
+    let [a, b, c, _] = h.to_le_bytes();
+    [a, b, c]
 }
 
 /// What compressing one frame leaves behind for the next: the match finder (with its
@@ -136,6 +141,7 @@ fn block_header(last: bool, kind: u32, size: usize, out: &mut Vec<u8>) {
 pub(crate) struct Context {
     finder: Option<(Params, Box<dyn MatchFinder>)>,
     store: SeqStore,
+    scratch: Scratch,
 }
 
 impl Context {
@@ -204,12 +210,23 @@ impl Frame {
             // The decoder doesn't see this block's sequences.
             self.reps = before;
         } else {
-            let (body, next) = block::body(&store, &self.entropy, self.raw_literals);
-            if body.len() < data.len() {
-                block_header(last, 2, body.len(), out);
-                out.extend_from_slice(&body);
+            // The body goes straight into `out` after room for its header, and comes out
+            // again if it's no smaller than the block.
+            let start = out.len();
+            out.extend_from_slice(&[0; 3]);
+            let next = block::body(
+                &store,
+                &self.entropy,
+                self.raw_literals,
+                &mut ctx.scratch,
+                out,
+            );
+            let size = out.len() - start - 3;
+            if size < data.len() {
+                out[start..start + 3].copy_from_slice(&header_bytes(last, 2, size));
                 self.entropy = next;
             } else {
+                out.truncate(start);
                 block_header(last, 0, data.len(), out);
                 out.extend_from_slice(data);
                 self.reps = before;

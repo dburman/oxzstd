@@ -70,6 +70,20 @@ impl BitWriter {
         }
     }
 
+    /// A writer that adds to the end of `out`, with room for `bytes` more: what it writes
+    /// goes straight into `out`, with no buffer of its own to copy from.
+    pub(crate) fn appending(mut out: Vec<u8>, bytes: usize) -> Self {
+        let pos = out.len();
+        out.resize(pos + bytes + 8, 0);
+        Self {
+            out,
+            bits: Bits {
+                pos,
+                ..Bits::default()
+            },
+        }
+    }
+
     /// The buffer and the bits apart, for a loop that writes many (see [`Bits`]).
     pub(crate) fn split(self) -> (Vec<u8>, Bits) {
         (self.out, self.bits)
@@ -103,7 +117,8 @@ impl BitWriter {
         self.bits.flush(&mut self.out);
     }
 
-    /// The bytes, the last one padded with zeros.
+    /// The bytes (after any the writer was [appending](Self::appending) to), the last one
+    /// padded with zeros.
     pub(crate) fn finish(mut self) -> Vec<u8> {
         self.flush();
         // The bits left are in the byte at `pos`, which the flush wrote.

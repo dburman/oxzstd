@@ -24,15 +24,51 @@ pub(crate) fn optimal_log(max_log: u32, total: usize, max_symbol: usize) -> u32 
     log.clamp(MIN_LOG, MAX_LOG.min(max_log.max(MIN_LOG)))
 }
 
-/// Scales `counts` (summing to `total`) to sum to `1 << log`. Symbols too rare for one cell
-/// get −1 when `low_prob` is set (a cheaper single cell), else 1. Returns `None` when one
-/// symbol has every count (RLE is the better choice then).
-pub(crate) fn normalize(
-    counts: &[u32],
-    total: usize,
-    log: u32,
-    low_prob: bool,
-) -> Option<Vec<i16>> {
+/// Normalized counts of up to [`MAX_SYMBOLS`] symbols, held inline: tables are made for
+/// every block, and most blocks are small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Norm {
+    counts: [i16; MAX_SYMBOLS],
+    len: usize,
+}
+
+impl Norm {
+    /// `len` zeros.
+    fn zeros(len: usize) -> Self {
+        assert!(len <= MAX_SYMBOLS, "{len} symbols");
+        Self {
+            counts: [0; MAX_SYMBOLS],
+            len,
+        }
+    }
+
+    /// A copy of `counts` (at most [`MAX_SYMBOLS`] of them).
+    pub(crate) fn new(counts: &[i16]) -> Self {
+        let mut norm = Self::zeros(counts.len());
+        norm.copy_from_slice(counts);
+        norm
+    }
+}
+
+impl std::ops::Deref for Norm {
+    type Target = [i16];
+
+    fn deref(&self) -> &[i16] {
+        &self.counts[..self.len]
+    }
+}
+
+impl std::ops::DerefMut for Norm {
+    fn deref_mut(&mut self) -> &mut [i16] {
+        &mut self.counts[..self.len]
+    }
+}
+
+/// Scales `counts` (summing to `total`, at most [`MAX_SYMBOLS`] of them) to sum to
+/// `1 << log`. Symbols too rare for one cell get −1 when `low_prob` is set (a cheaper single
+/// cell), else 1. Returns `None` when one symbol has every count (RLE is the better choice
+/// then).
+pub(crate) fn normalize(counts: &[u32], total: usize, log: u32, low_prob: bool) -> Option<Norm> {
     const RTB: [u64; 8] = [
         0, 473_195, 504_333, 520_860, 550_000, 700_000, 750_000, 830_000,
     ];
@@ -42,7 +78,7 @@ pub(crate) fn normalize(
     let v_step = 1u64 << (scale - 20);
     let mut to_distribute: i64 = 1 << log;
     let low_threshold = total >> log;
-    let mut norm = vec![0i16; counts.len()];
+    let mut norm = Norm::zeros(counts.len());
     let mut largest = 0usize;
     let mut largest_p = 0i64;
     for (s, &c) in counts.iter().enumerate() {
@@ -129,7 +165,7 @@ fn fix_by_steps(norm: &mut [i16], counts: &[u32], target: i64) {
 /// Writes a table description (the inverse of `fse::read_counts`).
 pub(crate) fn write_counts(norm: &[i16], log: u32, out: &mut Vec<u8>) {
     // At most 256 symbols of up to 16 bits, and the repeat flags.
-    let mut w = BitWriter::with_capacity(600);
+    let mut w = BitWriter::appending(std::mem::take(out), 600);
     w.add(u64::from(log - 5), 4);
     let mut remaining: i32 = (1 << log) + 1;
     let mut threshold: i32 = 1 << log;
@@ -171,7 +207,7 @@ pub(crate) fn write_counts(norm: &[i16], log: u32, out: &mut Vec<u8>) {
             threshold >>= 1;
         }
     }
-    out.extend_from_slice(&w.finish());
+    *out = w.finish();
 }
 
 /// A symbol's encoding transform.
@@ -181,12 +217,11 @@ struct Transform {
     delta_state: i32,
 }
 
-/// An [`EncodeTable`] borrowed for an encoding loop: plain slices, so the loop keeps them in
-/// registers.
+/// An [`EncodeTable`] borrowed for an encoding loop: one plain reference, so the loop keeps
+/// it in a register.
 #[derive(Clone, Copy)]
 pub(crate) struct TableView<'a> {
-    states: &'a [u16; MAX_STATES],
-    symbols: &'a [Transform; MAX_SYMBOLS],
+    cells: &'a Cells,
 }
 
 impl TableView<'_> {
@@ -197,11 +232,11 @@ impl TableView<'_> {
     pub(crate) fn encode(self, w: &mut Bits, state: &mut u32, symbol: u8) {
         // The masks only say what's already so (the tables are this big), and spare the
         // bounds checks.
-        let t = self.symbols[symbol as usize & (MAX_SYMBOLS - 1)];
+        let t = self.cells.symbols[symbol as usize & (MAX_SYMBOLS - 1)];
         let bits_out = (*state + t.delta_bits) >> 16;
         w.add_fast(u64::from(*state & ((1 << bits_out) - 1)), bits_out);
         let next = ((*state >> bits_out) as i32 + t.delta_state) as usize;
-        *state = u32::from(self.states[next & (MAX_STATES - 1)]);
+        *state = u32::from(self.cells.states[next & (MAX_STATES - 1)]);
     }
 }
 
@@ -212,10 +247,16 @@ const MAX_SYMBOLS: usize = 64;
 #[derive(Clone, Debug)]
 pub(crate) struct EncodeTable {
     log: u32,
-    /// The states, for a table of up to 512 (log 9).
-    states: Box<[u16; MAX_STATES]>,
+    cells: Box<Cells>,
+}
+
+/// A table's transforms and states, together: an encoding loop needs one pointer per table.
+#[derive(Clone, Debug)]
+struct Cells {
     /// Per symbol, for up to 64 (the most a sequence table has is 53).
-    symbols: Box<[Transform; MAX_SYMBOLS]>,
+    symbols: [Transform; MAX_SYMBOLS],
+    /// The states, for a table of up to 512 (log 9).
+    states: [u16; MAX_STATES],
 }
 
 impl EncodeTable {
@@ -224,8 +265,9 @@ impl EncodeTable {
         let size = 1usize << log;
         let mask = size - 1;
         let mut high = size - 1;
-        let mut cumul = vec![0u32; norm.len() + 1];
-        let mut spread = vec![0u8; size];
+        // On the stack: tables are built for every block, and most blocks are small.
+        let mut cumul = [0u32; MAX_SYMBOLS + 1];
+        let mut spread = [0u8; MAX_STATES];
         for (s, &n) in norm.iter().enumerate() {
             if n == -1 {
                 cumul[s + 1] = cumul[s] + 1;
@@ -247,14 +289,18 @@ impl EncodeTable {
                 }
             }
         }
-        let mut states = Box::new([0u16; MAX_STATES]);
-        let mut next = cumul.clone();
-        for (u, &s) in spread.iter().enumerate() {
+        let mut cells = Box::new(Cells {
+            symbols: [Transform::default(); MAX_SYMBOLS],
+            states: [0; MAX_STATES],
+        });
+        let states = &mut cells.states;
+        let mut next = cumul;
+        for (u, &s) in spread[..size].iter().enumerate() {
             let s = s as usize;
             states[next[s] as usize] = (size + u) as u16;
             next[s] += 1;
         }
-        let mut symbols = Box::new([Transform::default(); MAX_SYMBOLS]);
+        let symbols = &mut cells.symbols;
         let mut total: i32 = 0;
         for (s, &n) in norm.iter().enumerate() {
             symbols[s] = match n {
@@ -283,25 +329,20 @@ impl EncodeTable {
                 }
             };
         }
-        Self {
-            log,
-            states,
-            symbols,
-        }
+        Self { log, cells }
     }
 
     /// The table for one symbol that needs no bits (RLE mode).
     pub(crate) fn rle(symbol: u8) -> Self {
-        let mut symbols = Box::new([Transform::default(); MAX_SYMBOLS]);
-        symbols[symbol as usize] = Transform {
+        let mut cells = Box::new(Cells {
+            symbols: [Transform::default(); MAX_SYMBOLS],
+            states: [0; MAX_STATES],
+        });
+        cells.symbols[symbol as usize] = Transform {
             delta_bits: 0,
             delta_state: 0,
         };
-        Self {
-            log: 0,
-            states: Box::new([0; MAX_STATES]),
-            symbols,
-        }
+        Self { log: 0, cells }
     }
 
     /// The starting state for the last symbol encoded (the first one decoded).
@@ -310,10 +351,10 @@ impl EncodeTable {
         if self.log == 0 {
             return 0;
         }
-        let t = self.symbols[symbol as usize];
+        let t = self.cells.symbols[symbol as usize];
         let bits_out = (t.delta_bits + (1 << 15)) >> 16;
         let value = (bits_out << 16).wrapping_sub(t.delta_bits);
-        u32::from(self.states[((value >> bits_out) as i32 + t.delta_state) as usize])
+        u32::from(self.cells.states[((value >> bits_out) as i32 + t.delta_state) as usize])
     }
 
     /// Encodes `symbol`, writing the bits that let the decoder step back to `state`.
@@ -322,18 +363,16 @@ impl EncodeTable {
         if self.log == 0 {
             return;
         }
-        let t = self.symbols[symbol as usize];
+        let t = self.cells.symbols[symbol as usize];
         let bits_out = (*state + t.delta_bits) >> 16;
         w.add(u64::from(*state), bits_out);
-        *state = u32::from(self.states[((*state >> bits_out) as i32 + t.delta_state) as usize]);
+        let next = ((*state >> bits_out) as i32 + t.delta_state) as usize;
+        *state = u32::from(self.cells.states[next]);
     }
 
     /// The table borrowed for an encoding loop.
     pub(crate) fn view(&self) -> TableView<'_> {
-        TableView {
-            states: &self.states,
-            symbols: &self.symbols,
-        }
+        TableView { cells: &self.cells }
     }
 
     /// Writes the final state.
@@ -444,10 +483,30 @@ mod tests {
 
     #[test]
     fn encoded_symbols_decode() {
-        let data: Vec<u8> = (0..3000u32).map(|i| ((i * 7919) % 13) as u8 % 9).collect();
-        let counts = counts_of(&data, 8);
-        let norm = normalize(&counts, data.len(), 7, true).unwrap();
-        let enc = EncodeTable::new(&norm, 7);
+        let even: Vec<u8> = (0..3000u32).map(|i| ((i * 7919) % 13) as u8 % 9).collect();
+        // Mostly 0 to 3, with a few rarer symbols: below one cell with `low_prob`.
+        let skewed: Vec<u8> = (0..3000u32)
+            .map(|i| {
+                if i % 97 == 0 {
+                    4 + (i % 5) as u8
+                } else {
+                    (i % 4) as u8
+                }
+            })
+            .collect();
+        for data in [&even, &skewed] {
+            for low in [true, false] {
+                let counts = counts_of(data, 8);
+                let norm = normalize(&counts, data.len(), 7, low).unwrap();
+                // Counts both with single cells at the top of the table and without.
+                assert_eq!(norm.contains(&-1), low && data == &skewed);
+                round_trip(data, &norm);
+            }
+        }
+    }
+
+    fn round_trip(data: &[u8], norm: &[i16]) {
+        let enc = EncodeTable::new(norm, 7);
         // One state, symbols encoded last to first.
         let mut w = BitWriter::with_capacity(data.len());
         let mut state = enc.init(data[data.len() - 1]);
@@ -456,7 +515,7 @@ mod tests {
         }
         enc.flush(&mut w, state);
         let bytes = w.finish_backward();
-        let dec = fse::build_decode_table(&norm, 7).unwrap();
+        let dec = fse::build_decode_table(norm, 7).unwrap();
         let mut r = BackwardBits::new(&bytes).unwrap();
         let mut st = dec.init(&mut r);
         let mut out = Vec::new();

@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use super::matcher::{MatchFinder, count, emit, hash, read32};
+use super::matcher::{MatchFinder, count, emit, hash_word, read32, read64};
 use super::params::{Params, Strategy};
 use super::seq::{Reps, SeqStore};
 
@@ -22,17 +22,34 @@ pub(crate) struct Fast<const MLS: u32> {
     hash_log: u32,
     step: usize,
     window: usize,
-    /// The lowest position a match may come from in the current block: one bound for the
-    /// whole block, from its end, as the reference does.
-    low: usize,
 }
 
 /// The scan's state around a match.
 struct Scan<'a> {
+    /// The input up to the block's end.
     src: &'a [u8],
+    /// The finder's table: a power of two long, so masking an index keeps it in range
+    /// without a check.
+    table: &'a mut [u32],
+    hash_log: u32,
     anchor: usize,
+    /// The last position the scan reads 8 bytes at: the block's end less 8.
     limit: usize,
-    end: usize,
+    window: usize,
+}
+
+impl Scan<'_> {
+    /// The table slot for the bytes `word` (read at some position).
+    #[inline(always)]
+    fn slot<const MLS: u32>(&self, word: u64) -> usize {
+        hash_word(word, MLS, self.hash_log) & (self.table.len() - 1)
+    }
+
+    /// The table slot for the bytes at `pos`.
+    #[inline(always)]
+    fn slot_at<const MLS: u32>(&self, pos: usize) -> usize {
+        self.slot::<MLS>(read64(self.src, pos))
+    }
 }
 
 impl<const MLS: u32> Fast<MLS> {
@@ -49,51 +66,48 @@ impl<const MLS: u32> Fast<MLS> {
                 2
             },
             window: 1 << p.window_log,
-            low: 0,
         }
-    }
-
-    #[inline]
-    fn h(&self, src: &[u8], pos: usize) -> usize {
-        hash::<MLS>(src, pos, self.hash_log)
-    }
-
-    /// The position a table entry holds, if it's inside the window for the whole block.
-    #[inline(always)]
-    fn candidate(&self, entry: u32) -> Option<usize> {
-        let m = entry as usize;
-        (m >= self.low).then_some(m)
     }
 }
 
 impl<const MLS: u32> MatchFinder for Fast<MLS> {
     fn reset(&mut self) {
         self.table.fill(0);
-        self.low = 0;
     }
 
     fn find(&mut self, src: &[u8], block: Range<usize>, reps: &mut Reps, store: &mut SeqStore) {
         let end = block.end;
         // Hashing reads 8 bytes, and a match needs 4 more bytes after it to be worth it.
-        let limit = end.saturating_sub(8);
+        let Some(limit) = end.checked_sub(8) else {
+            store.push_lits(src, block.start, end);
+            return;
+        };
+        // The lowest position a match may come from: one bound for the whole block, from its
+        // end, as the reference does.
+        let low = end.saturating_sub(self.window);
+        let (step0, window) = (self.step, self.window);
         let mut s = Scan {
-            src,
+            src: &src[..end],
+            table: &mut self.table,
+            hash_log: self.hash_log,
             anchor: block.start,
             limit,
-            end,
+            window,
         };
+        // Never so (the table has 1 << hash_log entries), but said, so the masked indexes
+        // need no check.
+        if s.table.is_empty() {
+            store.push_lits(src, block.start, end);
+            return;
+        }
+        let src = s.src;
         let mut ip0 = block.start.max(1);
-        self.low = end.saturating_sub(self.window);
         'scan: loop {
             // The last offset, checked once until the next match rather than at every
             // position: one in the block (or any offset found in it) stays usable.
             let rep = reps.0[0] as usize;
-            let rep = if rep <= ip0 && rep <= self.window {
-                rep
-            } else {
-                0
-            };
-            let mut step = self.step;
+            let rep = if rep <= ip0 && rep <= window { rep } else { 0 };
+            let mut step = step0;
             let mut next_step = ip0 + STEP_INCREASE;
             let mut ip1 = ip0 + 1;
             let mut ip2 = ip0 + step;
@@ -101,13 +115,17 @@ impl<const MLS: u32> MatchFinder for Fast<MLS> {
             if ip3 >= limit {
                 break;
             }
-            let mut hash0 = self.h(src, ip0);
-            let mut hash1 = self.h(src, ip1);
-            let mut entry = self.table[hash0];
+            // The bytes at ip0 and ip1, read once: hashed, then compared with a candidate's.
+            let mut word0 = read64(src, ip0);
+            let mut word1 = read64(src, ip1);
+            let mut hash0 = s.slot::<MLS>(word0);
+            let mut hash1 = s.slot::<MLS>(word1);
+            let mut entry = s.table[hash0];
             loop {
                 // The last offset at ip2, then the candidate at ip0.
-                self.table[hash0] = ip0 as u32;
-                if rep > 0 && read32(src, ip2) == read32(src, ip2 - rep) {
+                s.table[hash0] = ip0 as u32;
+                let word2 = read64(src, ip2);
+                if rep > 0 && word2 as u32 == read32(src, ip2 - rep) {
                     let mut start = ip2;
                     let mut len = 4;
                     if start > s.anchor && src[start - 1] == src[start - 1 - rep] {
@@ -116,37 +134,40 @@ impl<const MLS: u32> MatchFinder for Fast<MLS> {
                     }
                     let len = len + count(src, start + len, start + len - rep, end);
                     emit(src, s.anchor, start, rep, len, reps, store);
-                    ip0 = self.after_match(&mut s, ip0, (ip1, hash1), start + len, reps, store);
+                    ip0 = after_match::<MLS>(&mut s, ip0, (ip1, hash1), start + len, reps, store);
                     continue 'scan;
                 }
-                if let Some(m) = self.candidate(entry)
-                    && read32(src, m) == read32(src, ip0)
-                {
-                    ip0 = self.take(&mut s, ip0, m, (ip1, hash1), reps, store);
+                let m = entry as usize;
+                if m >= low && read32(src, m) == word0 as u32 {
+                    ip0 = take::<MLS>(&mut s, ip0, m, (ip1, hash1), reps, store);
                     continue 'scan;
                 }
                 // Step to ip1.
-                entry = self.table[hash1];
+                entry = s.table[hash1];
                 hash0 = hash1;
-                hash1 = self.h(src, ip2);
+                hash1 = s.slot::<MLS>(word2);
+                word0 = word1;
+                word1 = word2;
                 ip0 = ip1;
                 ip1 = ip2;
                 ip2 = ip3;
-                self.table[hash0] = ip0 as u32;
-                if let Some(m) = self.candidate(entry)
-                    && read32(src, m) == read32(src, ip0)
-                {
-                    ip0 = self.take(&mut s, ip0, m, (ip1, hash1), reps, store);
+                s.table[hash0] = ip0 as u32;
+                let m = entry as usize;
+                if m >= low && read32(src, m) == word0 as u32 {
+                    ip0 = take::<MLS>(&mut s, ip0, m, (ip1, hash1), reps, store);
                     continue 'scan;
                 }
                 // And on by a whole step.
-                entry = self.table[hash1];
+                let word2 = read64(src, ip2);
+                entry = s.table[hash1];
                 hash0 = hash1;
-                hash1 = self.h(src, ip2);
+                hash1 = s.slot::<MLS>(word2);
+                word0 = word1;
+                word1 = word2;
                 ip0 = ip1;
                 ip1 = ip2;
                 ip2 = ip0 + step;
-                ip3 = ip1 + step;
+                ip3 = ip2 + 1;
                 if ip2 >= next_step {
                     step += 1;
                     next_step += STEP_INCREASE;
@@ -160,74 +181,72 @@ impl<const MLS: u32> MatchFinder for Fast<MLS> {
     }
 }
 
-impl<const MLS: u32> Fast<MLS> {
-    /// A hash match at `ip` with `m`: extend it backwards, record it, and go on after it.
-    #[inline(always)]
-    fn take(
-        &mut self,
-        s: &mut Scan<'_>,
-        ip: usize,
-        m: usize,
-        next: (usize, usize),
-        reps: &mut Reps,
-        store: &mut SeqStore,
-    ) -> usize {
-        let src = s.src;
-        let (mut a, mut c) = (ip, m);
-        while a > s.anchor && c > 0 && src[a - 1] == src[c - 1] {
-            a -= 1;
-            c -= 1;
-        }
-        let len = count(src, a, c, s.end);
-        emit(src, s.anchor, a, a - c, len, reps, store);
-        self.after_match(s, ip, next, a + len, reps, store)
+/// A hash match at `ip` with `m`: extend it backwards, record it, and go on after it.
+#[inline(always)]
+fn take<const MLS: u32>(
+    s: &mut Scan<'_>,
+    ip: usize,
+    m: usize,
+    next: (usize, usize),
+    reps: &mut Reps,
+    store: &mut SeqStore,
+) -> usize {
+    let src = s.src;
+    // Forwards past the 4 bytes known to match, then backwards: apart, so the count needn't
+    // wait on the bytes before.
+    let (mut a, mut c) = (ip, m);
+    let mut len = 4 + count(src, ip + 4, m + 4, src.len());
+    while a > s.anchor && c > 0 && src[a - 1] == src[c - 1] {
+        a -= 1;
+        c -= 1;
+        len += 1;
     }
+    emit(src, s.anchor, a, a - c, len, reps, store);
+    after_match::<MLS>(s, ip, next, a + len, reps, store)
+}
 
-    /// After a match found while scanning from `scan`, ending at `ip`: fill the table a
-    /// little, then take repeats of the second offset straight away (no literals between).
-    /// `next` is the position the scan had hashed next, and its hash. Returns where the scan
-    /// resumes.
-    #[inline(always)]
-    fn after_match(
-        &mut self,
-        s: &mut Scan<'_>,
-        scan: usize,
-        next: (usize, usize),
-        mut ip: usize,
-        reps: &mut Reps,
-        store: &mut SeqStore,
-    ) -> usize {
-        let src = s.src;
-        s.anchor = ip;
-        // Only a position the match covers: one past it is still to be scanned, and would
-        // find itself in the table.
-        if next.0 < ip {
-            self.table[next.1] = next.0 as u32;
-        }
-        if ip > s.limit {
-            return ip;
-        }
-        if scan + 2 < ip {
-            let h = self.h(src, scan + 2);
-            self.table[h] = scan as u32 + 2;
-        }
-        let h = self.h(src, ip - 2);
-        self.table[h] = ip as u32 - 2;
-        while ip <= s.limit {
-            let rep2 = reps.0[1] as usize;
-            if rep2 == 0 || rep2 > ip || rep2 > self.window {
-                break;
-            }
-            if read32(src, ip) != read32(src, ip - rep2) {
-                break;
-            }
-            let len = 4 + count(src, ip + 4, ip + 4 - rep2, s.end);
-            let h = self.h(src, ip);
-            self.table[h] = ip as u32;
-            emit(src, s.anchor, ip, rep2, len, reps, store);
-            ip += len;
-            s.anchor = ip;
-        }
-        ip
+/// After a match found while scanning from `scan`, ending at `ip`: fill the table a little,
+/// then take repeats of the second offset straight away (no literals between). `next` is the
+/// position the scan had hashed next, and its slot. Returns where the scan resumes.
+#[inline(always)]
+fn after_match<const MLS: u32>(
+    s: &mut Scan<'_>,
+    scan: usize,
+    next: (usize, usize),
+    mut ip: usize,
+    reps: &mut Reps,
+    store: &mut SeqStore,
+) -> usize {
+    let src = s.src;
+    s.anchor = ip;
+    // Only a position the match covers: one past it is still to be scanned, and would find
+    // itself in the table.
+    if next.0 < ip {
+        s.table[next.1] = next.0 as u32;
     }
+    if ip > s.limit {
+        return ip;
+    }
+    if scan + 2 < ip {
+        let h = s.slot_at::<MLS>(scan + 2);
+        s.table[h] = scan as u32 + 2;
+    }
+    let h = s.slot_at::<MLS>(ip - 2);
+    s.table[h] = ip as u32 - 2;
+    while ip <= s.limit {
+        let rep2 = reps.0[1] as usize;
+        if rep2 == 0 || rep2 > ip || rep2 > s.window {
+            break;
+        }
+        if read32(src, ip) != read32(src, ip - rep2) {
+            break;
+        }
+        let len = 4 + count(src, ip + 4, ip + 4 - rep2, src.len());
+        let h = s.slot_at::<MLS>(ip);
+        s.table[h] = ip as u32;
+        emit(src, s.anchor, ip, rep2, len, reps, store);
+        ip += len;
+        s.anchor = ip;
+    }
+    ip
 }

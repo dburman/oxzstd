@@ -49,12 +49,23 @@ pub(crate) fn hash<const MLS: u32>(src: &[u8], pos: usize, bits: u32) -> usize {
 #[inline(always)]
 pub(crate) fn hash_dyn(src: &[u8], pos: usize, mls: u32, bits: u32) -> usize {
     match mls {
-        3 => ((read32(src, pos) << 8).wrapping_mul(PRIME3) >> (32 - bits)) as usize,
-        4 => (read32(src, pos).wrapping_mul(PRIME4) >> (32 - bits)) as usize,
-        5 => ((read64(src, pos) << 24).wrapping_mul(PRIME5) >> (64 - bits)) as usize,
-        6 => ((read64(src, pos) << 16).wrapping_mul(PRIME6) >> (64 - bits)) as usize,
-        7 => ((read64(src, pos) << 8).wrapping_mul(PRIME7) >> (64 - bits)) as usize,
-        _ => (read64(src, pos).wrapping_mul(PRIME8) >> (64 - bits)) as usize,
+        3 | 4 => hash_word(u64::from(read32(src, pos)), mls, bits),
+        _ => hash_word(read64(src, pos), mls, bits),
+    }
+}
+
+/// [`hash`] of the bytes already read: `word` holds the 8 at the position (or at least the
+/// first 4, for `mls` 3 and 4), first byte lowest. A scan that compares the bytes it hashed
+/// reads them once.
+#[inline(always)]
+pub(crate) fn hash_word(word: u64, mls: u32, bits: u32) -> usize {
+    match mls {
+        3 => (((word as u32) << 8).wrapping_mul(PRIME3) >> (32 - bits)) as usize,
+        4 => ((word as u32).wrapping_mul(PRIME4) >> (32 - bits)) as usize,
+        5 => ((word << 24).wrapping_mul(PRIME5) >> (64 - bits)) as usize,
+        6 => ((word << 16).wrapping_mul(PRIME6) >> (64 - bits)) as usize,
+        7 => ((word << 8).wrapping_mul(PRIME7) >> (64 - bits)) as usize,
+        _ => (word.wrapping_mul(PRIME8) >> (64 - bits)) as usize,
     }
 }
 

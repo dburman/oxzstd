@@ -85,12 +85,18 @@ fn tree_lengths(counts: &[u32; 256], used: &[usize], lengths: &mut [u8; 256]) {
     // made. Ties go to the lower node (leaves before internal nodes), so the result is the
     // same as always taking the two lightest, lowest-numbered nodes.
     let n = used.len();
-    let mut leaves = [(0u64, 0usize); 256];
+    // Sorted as one key each, the count above the index (under 256): the same order as the
+    // pairs, and faster to sort.
+    let mut keys = [0u64; 256];
     for (i, &s) in used.iter().enumerate() {
-        leaves[i] = (u64::from(counts[s]), i);
+        keys[i] = u64::from(counts[s]) << 8 | i as u64;
     }
-    let leaves = &mut leaves[..n];
-    leaves.sort_unstable();
+    keys[..n].sort_unstable();
+    let mut leaves = [(0u64, 0usize); 256];
+    for (leaf, &k) in leaves.iter_mut().zip(&keys[..n]) {
+        *leaf = (k >> 8, (k & 0xFF) as usize);
+    }
+    let leaves = &leaves[..n];
     let mut parent = [0usize; 512];
     let mut weight = [0u64; 512];
     let (mut next_leaf, mut next_inner, mut next) = (0, n, n);
@@ -115,6 +121,10 @@ fn tree_lengths(counts: &[u32; 256], used: &[usize], lengths: &mut [u8; 256]) {
 /// Limits lengths to `max` while keeping the code complete (the Kraft sum exactly one), as
 /// the decoder requires.
 fn limit_lengths(counts: &[u32; 256], used: &[usize], lengths: &mut [u8; 256], max: u32) {
+    // A tree within the limit is complete already: nothing to do (most blocks).
+    if used.iter().all(|&s| u32::from(lengths[s]) <= max) {
+        return;
+    }
     let unit = |len: u8| 1u64 << (max - u32::from(len));
     let target = 1u64 << max;
     for &s in used {
@@ -197,7 +207,7 @@ impl Code {
 
     /// Encodes `lits` as one stream.
     pub(crate) fn encode_stream(&self, lits: &[u8], out: &mut Vec<u8>) {
-        let mut w = BitWriter::with_capacity((lits.len() * 11).div_ceil(8) + 1);
+        let mut w = BitWriter::appending(std::mem::take(out), (lits.len() * 11).div_ceil(8) + 1);
         // Codes are at most 11 bits: four fit after a flush.
         let tail = lits.len() % 4;
         for &b in lits[lits.len() - tail..].iter().rev() {
@@ -219,7 +229,7 @@ impl Code {
                 );
             }
         }
-        out.extend_from_slice(&BitWriter::join(buf, bits).finish_backward());
+        *out = BitWriter::join(buf, bits).finish_backward();
     }
 
     /// Encodes `lits` as four streams with their jump table; `None` if a stream is too large

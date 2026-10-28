@@ -149,14 +149,16 @@ impl Reps {
     }
 }
 
-const fn build_ll() -> [u8; 64] {
-    let mut t = [0u8; 64];
+/// The code, and its count of extra bits, for each value below `N` of a length table whose
+/// values start at `first`.
+const fn build<const N: usize>(codes: &[(u32, u8)], first: u32) -> [(u8, u8); N] {
+    let mut t = [(0u8, 0u8); N];
     let mut code = 0;
-    while code < LL_CODES.len() {
-        let (base, bits) = LL_CODES[code];
-        let mut v = base;
-        while v < base + (1 << bits) && v < 64 {
-            t[v as usize] = code as u8;
+    while code < codes.len() {
+        let (base, bits) = codes[code];
+        let mut v = base - first;
+        while v < base - first + (1 << bits) && v < N as u32 {
+            t[v as usize] = (code as u8, bits);
             v += 1;
         }
         code += 1;
@@ -164,42 +166,43 @@ const fn build_ll() -> [u8; 64] {
     t
 }
 
-const fn build_ml() -> [u8; 128] {
-    let mut t = [0u8; 128];
-    let mut code = 0;
-    while code < ML_CODES.len() {
-        let (base, bits) = ML_CODES[code];
-        let mut v = base - 3;
-        while v < base - 3 + (1 << bits) && v < 128 {
-            t[v as usize] = code as u8;
-            v += 1;
-        }
-        code += 1;
-    }
-    t
-}
-
-const LL_TABLE: [u8; 64] = build_ll();
-const ML_TABLE: [u8; 128] = build_ml();
+const LL_TABLE: [(u8, u8); 64] = build(&LL_CODES, 0);
+const ML_TABLE: [(u8, u8); 128] = build(&ML_CODES, 3);
 
 /// The literal-length code for `lit_len`.
 #[inline]
 pub(crate) fn ll_code(lit_len: u32) -> u8 {
-    if lit_len < 64 {
-        LL_TABLE[lit_len as usize]
-    } else {
-        (lit_len.ilog2() + 19) as u8
-    }
+    ll_code_bits(lit_len).0
 }
 
 /// The match-length code for `match_len` (at least 3).
 #[inline]
 pub(crate) fn ml_code(match_len: u32) -> u8 {
+    ml_code_bits(match_len).0
+}
+
+/// The literal-length code for `lit_len`, and how many extra bits it has. Each code's base is
+/// a multiple of the span its extra bits cover, so the extra bits are the value's low bits.
+#[inline(always)]
+pub(crate) fn ll_code_bits(lit_len: u32) -> (u8, u8) {
+    if lit_len < 64 {
+        LL_TABLE[lit_len as usize]
+    } else {
+        let log = lit_len.ilog2();
+        ((log + 19) as u8, log as u8)
+    }
+}
+
+/// The match-length code for `match_len` (at least 3), and how many extra bits it has. As
+/// for literal lengths, the extra bits are the low bits of `match_len - 3`.
+#[inline(always)]
+pub(crate) fn ml_code_bits(match_len: u32) -> (u8, u8) {
     let base = match_len - 3;
     if base < 128 {
         ML_TABLE[base as usize]
     } else {
-        (base.ilog2() + 36) as u8
+        let log = base.ilog2();
+        ((log + 36) as u8, log as u8)
     }
 }
 
@@ -217,14 +220,20 @@ mod tests {
     fn codes_agree_with_the_decoders_tables() {
         // Up to the largest lengths the format can code (a block is at most 128 KiB).
         for ll in 0..131_072u32 {
-            let c = ll_code(ll) as usize;
-            let (base, bits) = LL_CODES[c];
+            let (c, b) = ll_code_bits(ll);
+            let (base, bits) = LL_CODES[c as usize];
             assert!(ll >= base && ll < base + (1 << bits), "ll {ll} -> code {c}");
+            assert_eq!((b, ll - base), (bits, ll & ((1 << bits) - 1)), "ll {ll}");
         }
         for ml in 3..131_075u32 {
-            let c = ml_code(ml) as usize;
-            let (base, bits) = ML_CODES[c];
+            let (c, b) = ml_code_bits(ml);
+            let (base, bits) = ML_CODES[c as usize];
             assert!(ml >= base && ml < base + (1 << bits), "ml {ml} -> code {c}");
+            assert_eq!(
+                (b, ml - base),
+                (bits, (ml - 3) & ((1 << bits) - 1)),
+                "ml {ml}"
+            );
         }
         assert_eq!(of_code(1), 0);
         assert_eq!(of_code(4), 2);
