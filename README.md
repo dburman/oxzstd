@@ -19,9 +19,9 @@ C library. oxzstd is a complete implementation of its own instead:
   oxzstd. The tests check both directions against the real `zstd`.
 - **Same compression:** it has every one of the reference's compression strategies, from the
   fastest to the optimal parser, and its output at each level is within half a percent of
-  the reference's size (levels 13 to 15: within 2.5%, smaller or larger).
-- **Close in speed:** compression runs at 70 to 100% of the reference's speed at most levels,
-  decompression at 60 to 100%; see [`docs/benchmarks.md`](docs/benchmarks.md).
+  the reference's size on most inputs (within 1.5% on all the benchmark's).
+- **Close in speed:** compression runs at 70 to 110% of the reference's speed at most levels,
+  decompression at 70 to 100%; see [`docs/benchmarks.md`](docs/benchmarks.md).
 - **No `unsafe`:** the crate forbids it, and CI checks that nothing re-allows it. Malformed
   input gives an error, never a panic.
 - **No dependencies and no C:** no C compiler or `cmake` in the build, nothing to

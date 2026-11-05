@@ -313,8 +313,7 @@ pub(crate) fn sequences(
     }
     let coded = &mut scratch.coded;
     coded.clear();
-    coded.extend(seqs.iter().map(Coded::new));
-    let (ll_counts, of_counts, ml_counts) = count_codes(coded);
+    let (ll_counts, of_counts, ml_counts) = code_and_count(seqs, coded);
     let ll = choose(&ll_counts, n, (&fse::LL_DEFAULT, 6), 9, entropy.ll.as_ref());
     let of = choose(&of_counts, n, (&fse::OF_DEFAULT, 5), 8, entropy.of.as_ref());
     let ml = choose(&ml_counts, n, (&fse::ML_DEFAULT, 6), 9, entropy.ml.as_ref());
@@ -382,10 +381,10 @@ impl Coded {
     }
 }
 
-/// How often each literal-length, offset and match-length code occurs in `coded`. Counted
-/// into four sets of tables in turn, so that a run of one code doesn't make each increment
-/// wait on the one before it.
-fn count_codes(coded: &[Coded]) -> ([u32; 36], [u32; 32], [u32; 53]) {
+/// Codes `seqs` into `coded`, and counts how often each literal-length, offset and
+/// match-length code occurs, in one pass. The counts go into four sets of tables in turn, so
+/// that a run of one code doesn't make each increment wait on the one before it.
+fn code_and_count(seqs: &[Seq], coded: &mut Vec<Coded>) -> ([u32; 36], [u32; 32], [u32; 53]) {
     // Each set: literal lengths at 0, offsets at 64, match lengths at 128. The masks only say
     // what's already so (the codes are in range), and spare the bounds checks.
     let mut sets = [[0u32; 192]; 4];
@@ -395,13 +394,24 @@ fn count_codes(coded: &[Coded]) -> ([u32; 36], [u32; 32], [u32; 53]) {
         t[64 + (c.of as usize & 63)] += 1;
         t[128 + (c.ml as usize & 63)] += 1;
     };
-    let (quads, rest) = coded.as_chunks::<4>();
-    for q in quads {
-        for (set, c) in q.iter().enumerate() {
+    coded.clear();
+    // Each overwritten below; any valid sequence will do to fill.
+    let filler = Coded::new(&Seq {
+        lit_len: 0,
+        match_len: 3,
+        off_value: 1,
+    });
+    coded.resize(seqs.len(), filler);
+    let (quads, rest) = seqs.as_chunks::<4>();
+    let (out_quads, out_rest) = coded.as_chunks_mut::<4>();
+    for (q, out) in quads.iter().zip(out_quads) {
+        for (set, (s, c)) in q.iter().zip(out).enumerate() {
+            *c = Coded::new(s);
             add(set, c);
         }
     }
-    for c in rest {
+    for (s, c) in rest.iter().zip(out_rest) {
+        *c = Coded::new(s);
         add(0, c);
     }
     let total = |at: usize, i: usize| sets.iter().map(|t| t[at + i]).sum::<u32>();

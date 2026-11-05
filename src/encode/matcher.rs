@@ -91,6 +91,20 @@ pub(crate) fn count(src: &[u8], a: usize, b: usize, limit: usize) -> usize {
         .count()
 }
 
+/// [`count`] for matches that are mostly short (as the fast strategies find them): the first
+/// 8 bytes compared at once, without setting up the loop.
+#[inline(always)]
+pub(crate) fn count_short(src: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    if a + 8 <= limit {
+        let diff = read64(src, a) ^ read64(src, b);
+        if diff != 0 {
+            return (diff.trailing_zeros() / 8) as usize;
+        }
+        return 8 + count(src, a + 8, b + 8, limit);
+    }
+    count(src, a, b, limit)
+}
+
 /// Records literals `src[anchor..start]` and a match of `len` bytes `offset` back.
 #[inline(always)]
 pub(crate) fn emit(
@@ -170,6 +184,20 @@ mod tests {
                     let limit = limit.min(200);
                     let slow = (a..limit).take_while(|&i| src[i] == src[i - a + b]).count();
                     assert_eq!(count(&src, a, b, limit), slow, "{a} {b} {limit}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counting_short_agrees_with_counting() {
+        let mut src: Vec<u8> = (0..200u32).map(|i| (i % 7) as u8).collect();
+        src[150] = 99;
+        for b in 0..20 {
+            for a in b + 1..60 {
+                for limit in [a, a + 1, a + 7, a + 8, a + 9, a + 30, 200] {
+                    let limit = limit.min(200);
+                    assert_eq!(count_short(&src, a, b, limit), count(&src, a, b, limit));
                 }
             }
         }

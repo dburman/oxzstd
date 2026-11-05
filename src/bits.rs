@@ -18,6 +18,8 @@ fn load_le(data: &[u8], pos: usize) -> u64 {
 }
 
 /// [`load_le`] near the end, kept out of line so the hot loops stay small.
+#[cold]
+#[inline(never)]
 fn load_partial(data: &[u8], pos: usize) -> u64 {
     let mut a = [0u8; 8];
     if pos < data.len() {

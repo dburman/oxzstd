@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use super::matcher::{MatchFinder, count, emit, hash, read32};
+use super::matcher::{MatchFinder, count, emit, hash, hash_word, read32, read64};
 use super::params::{Params, Strategy};
 use super::seq::{Reps, SeqStore};
 
@@ -107,8 +107,9 @@ pub(crate) struct HashChain<const MLS: u32> {
     hash: Vec<u32>,
     hash_log: u32,
     /// Previous position + 1 with the same hash, indexed by position + 1 under the mask.
+    /// Both tables are a power of two long, so masking an index keeps it in range without a
+    /// check.
     chain: Vec<u32>,
-    chain_mask: usize,
     attempts: u32,
     window: usize,
     /// The first position not yet entered into the tables.
@@ -121,7 +122,6 @@ impl<const MLS: u32> HashChain<MLS> {
             hash: vec![0; 1 << p.hash_log],
             hash_log: p.hash_log,
             chain: vec![0; 1 << p.chain_log],
-            chain_mask: (1 << p.chain_log) - 1,
             attempts: 1 << p.search_log,
             window: 1 << p.window_log,
             next_to_update: 0,
@@ -132,18 +132,26 @@ impl<const MLS: u32> HashChain<MLS> {
     /// with `ip`'s hash, + 1 (0 for none).
     #[inline]
     fn insert_and_find(&mut self, src: &[u8], ip: usize, skipping: bool) -> u32 {
-        while self.next_to_update < ip {
-            let pos = self.next_to_update;
-            let h = hash::<MLS>(src, pos, self.hash_log);
-            self.chain[(pos + 1) & self.chain_mask] = self.hash[h];
-            self.hash[h] = pos as u32 + 1;
-            self.next_to_update += 1;
+        let (hash, chain) = (&mut self.hash[..], &mut self.chain[..]);
+        // Never so, but said, so the masked indexes need no check.
+        if hash.is_empty() || chain.is_empty() {
+            return 0;
+        }
+        let (hash_mask, chain_mask) = (hash.len() - 1, chain.len() - 1);
+        let hash_log = self.hash_log;
+        let slot = |pos: usize| hash_word(read64(src, pos), MLS, hash_log) & hash_mask;
+        let mut pos = self.next_to_update;
+        while pos < ip {
+            let h = slot(pos);
+            chain[(pos + 1) & chain_mask] = hash[h];
+            hash[h] = pos as u32 + 1;
+            pos += 1;
             if skipping {
                 break;
             }
         }
-        self.next_to_update = self.next_to_update.max(ip);
-        self.hash[hash::<MLS>(src, ip, self.hash_log)]
+        self.next_to_update = pos.max(ip);
+        hash[slot(ip)]
     }
 }
 
@@ -163,9 +171,13 @@ impl<const MLS: u32> Search for HashChain<MLS> {
     ) -> Option<(usize, usize)> {
         let cur = ip + 1;
         let low = cur.saturating_sub(self.window).max(1);
-        let min_chain = cur.saturating_sub(self.chain_mask + 1);
         let mut index = self.insert_and_find(src, ip, skipping) as usize;
-        let mut best = Best::default();
+        let chain = &self.chain[..];
+        if chain.is_empty() {
+            return None;
+        }
+        let min_chain = cur.saturating_sub(chain.len());
+        let mut best = Best::new(src, ip);
         for _ in 0..self.attempts {
             if index < low {
                 break;
@@ -176,7 +188,7 @@ impl<const MLS: u32> Search for HashChain<MLS> {
             if index <= min_chain {
                 break;
             }
-            index = self.chain[index & self.chain_mask] as usize;
+            index = chain[index & (chain.len() - 1)] as usize;
         }
         best.found
     }
@@ -191,15 +203,20 @@ struct Best {
     /// One less than the shortest match worth having next.
     ml: usize,
     found: Option<(usize, usize)>,
-}
-
-impl Default for Best {
-    fn default() -> Self {
-        Self { ml: 3, found: None }
-    }
+    /// The 4 bytes such a match has to end with: those at `ip + ml - 3`, read once for all
+    /// the candidates rather than for each.
+    tail: u32,
 }
 
 impl Best {
+    fn new(src: &[u8], ip: usize) -> Self {
+        Self {
+            ml: 3,
+            found: None,
+            tail: read32(src, ip),
+        }
+    }
+
     /// Measures the candidate `m` for `ip`; returns whether the match reaches `end`, so no
     /// longer one is possible.
     #[inline(always)]
@@ -207,12 +224,15 @@ impl Best {
         // Only a match longer than the best so far is worth counting: check the 4 bytes that
         // end where it would have to reach.
         let ml = self.ml;
-        if read32(src, m + ml - 3) == read32(src, ip + ml - 3) {
+        if read32(src, m + ml - 3) == self.tail {
             let len = count(src, ip, m, end);
             if len > ml {
                 self.ml = len;
                 self.found = Some((len, ip - m));
-                return ip + len == end;
+                if ip + len == end {
+                    return true;
+                }
+                self.tail = read32(src, ip + len - 3);
             }
         }
         false
@@ -357,29 +377,26 @@ impl<const MLS: u32, const ROW_LOG: u32> Search for Row<MLS, ROW_LOG> {
         } else {
             ((matches >> head) | (matches << (entries - head))) & full
         };
-        let mut candidates = [0u32; 64];
+        // Each candidate measured as it's found (nothing here writes the row).
+        let mut best = Best::new(src, ip);
         let mut found = 0;
         while matches != 0 && found < self.attempts {
             let slot = (head + matches.trailing_zeros() as usize) & mask;
             matches &= matches - 1;
-            let index = self.table[row + slot];
-            if (index as usize) < low {
+            let index = self.table[row + slot] as usize;
+            if index < low {
                 break;
             }
-            candidates[found] = index;
             found += 1;
+            if best.try_candidate(src, ip, index - 1, end) {
+                break;
+            }
         }
         // The current position goes in now, saving the next update a step.
         let slot = self.next_slot(row);
         self.tags[row + slot] = tag;
         self.table[row + slot] = ip as u32 + 1;
         self.next_to_update = ip + 1;
-        let mut best = Best::default();
-        for &index in &candidates[..found] {
-            if best.try_candidate(src, ip, index as usize - 1, end) {
-                break;
-            }
-        }
         best.found
     }
 

@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use super::matcher::{MatchFinder, count, emit, hash_word, read32, read64};
+use super::matcher::{MatchFinder, count_short, emit, hash_word, read32, read64};
 use super::params::Params;
 use super::seq::{Reps, SeqStore};
 
@@ -116,7 +116,7 @@ impl Scan<'_> {
             let rep = reps.0[0] as usize;
             // The 4 bytes at ip + 1 are in the word read at ip.
             if self.usable(rep, ip + 1) && (word0 >> 8) as u32 == read32(src, ip + 1 - rep) {
-                let len = 4 + count(src, ip + 5, ip + 5 - rep, end);
+                let len = 4 + count_short(src, ip + 5, ip + 5 - rep, end);
                 return Some((Found::Repeat { at: ip + 1, len }, ip));
             }
             let word1 = read64(src, ip1);
@@ -124,16 +124,16 @@ impl Scan<'_> {
             let found = if let Some(m) = self.candidate(idxl0)
                 && read64(src, m) == word0
             {
-                Some((ip, m, 8 + count(src, ip + 8, m + 8, end)))
+                Some((ip, m, 8 + count_short(src, ip + 8, m + 8, end)))
             } else if let Some(m) = self.candidate(idxs0)
                 && read32(src, m) == word0 as u32
             {
                 // A short match: a long one at the next position beats it.
                 match self.candidate(self.long[hl1]) {
                     Some(m1) if read64(src, m1) == word1 => {
-                        Some((ip1, m1, 8 + count(src, ip1 + 8, m1 + 8, end)))
+                        Some((ip1, m1, 8 + count_short(src, ip1 + 8, m1 + 8, end)))
                     }
-                    _ => Some((ip, m, 4 + count(src, ip + 4, m + 4, end))),
+                    _ => Some((ip, m, 4 + count_short(src, ip + 4, m + 4, end))),
                 }
             } else {
                 None
@@ -237,7 +237,7 @@ impl<const MLS: u32> MatchFinder for DoubleFast<MLS> {
                 if word as u32 != read32(src, ip - rep2) {
                     break;
                 }
-                let len = 4 + count(src, ip + 4, ip + 4 - rep2, end);
+                let len = 4 + count_short(src, ip + 4, ip + 4 - rep2, end);
                 let h = s.short_slot::<MLS>(word);
                 s.short[h] = ip as u32;
                 let h = s.long_slot(word);

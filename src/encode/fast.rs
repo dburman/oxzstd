@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use super::matcher::{MatchFinder, count, emit, hash_word, read32, read64};
+use super::matcher::{MatchFinder, count_short, emit, hash_word, read32, read64};
 use super::params::{Params, Strategy};
 use super::seq::{Reps, SeqStore};
 
@@ -132,7 +132,7 @@ impl<const MLS: u32> MatchFinder for Fast<MLS> {
                         start -= 1;
                         len += 1;
                     }
-                    let len = len + count(src, start + len, start + len - rep, end);
+                    let len = len + count_short(src, start + len, start + len - rep, end);
                     emit(src, s.anchor, start, rep, len, reps, store);
                     ip0 = after_match::<MLS>(&mut s, ip0, (ip1, hash1), start + len, reps, store);
                     continue 'scan;
@@ -195,7 +195,7 @@ fn take<const MLS: u32>(
     // Forwards past the 4 bytes known to match, then backwards: apart, so the count needn't
     // wait on the bytes before.
     let (mut a, mut c) = (ip, m);
-    let mut len = 4 + count(src, ip + 4, m + 4, src.len());
+    let mut len = 4 + count_short(src, ip + 4, m + 4, src.len());
     while a > s.anchor && c > 0 && src[a - 1] == src[c - 1] {
         a -= 1;
         c -= 1;
@@ -241,7 +241,7 @@ fn after_match<const MLS: u32>(
         if read32(src, ip) != read32(src, ip - rep2) {
             break;
         }
-        let len = 4 + count(src, ip + 4, ip + 4 - rep2, src.len());
+        let len = 4 + count_short(src, ip + 4, ip + 4 - rep2, src.len());
         let h = s.slot_at::<MLS>(ip);
         s.table[h] = ip as u32;
         emit(src, s.anchor, ip, rep2, len, reps, store);

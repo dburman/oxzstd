@@ -823,6 +823,10 @@ struct Seqs<'a> {
 
 /// Decodes the sequences and executes them into `out`, writing nothing at or past `stop` but
 /// the copies' slack. Returns where the output ends. `STATS` counts what the sequences use.
+///
+/// A function of its own, with the repeat offsets in a local, so the loop keeps its state in
+/// registers rather than on the stack.
+#[inline(never)]
 fn execute<const STATS: bool>(
     seqs: &Seqs<'_>,
     state: &mut State,
@@ -852,6 +856,7 @@ fn execute<const STATS: bool>(
     let mut ml_state = bits.read(ml.log) as usize;
     let mut lit_pos = 0usize;
     let mut op = seqs.start;
+    let mut rep = *reps;
     for i in 0..seqs.count {
         let (llc, ofc, mlc) = (ll.cell(ll_state), of.cell(of_state), ml.cell(ml_state));
         // After a reload at least 57 bits are in the window. The extra bits of one sequence
@@ -873,7 +878,7 @@ fn execute<const STATS: bool>(
             TableView::update(mlc, &mut ml_state, &mut bits);
             TableView::update(ofc, &mut of_state, &mut bits);
         }
-        let offset = resolve_offset(offset_value, lit_len, reps)? as usize;
+        let offset = resolve_offset(offset_value, lit_len, &mut rep)? as usize;
         if STATS {
             st.record(offset_value, lit_len, match_len);
         }
@@ -895,6 +900,7 @@ fn execute<const STATS: bool>(
     if !bits.finished() {
         return Err(Error::Corrupt("sequence stream has bits left over"));
     }
+    *reps = rep;
     if STATS {
         *stats = Some(st);
     }
@@ -994,26 +1000,87 @@ fn copy_match(out: &mut [u8], op: usize, offset: usize, len: usize) {
             out.copy_within(d - offset..d - offset + 16, d);
             d += 16;
         }
+    } else if cfg!(target_arch = "aarch64") {
+        copy_match_short_inline(out, op, offset, len);
     } else {
-        // A short offset repeats a pattern: lay out 16 bytes of it, then copy on from a
-        // distance that's a whole number of periods and at least 16.
-        let mut pattern = [0u8; 16];
-        let mut j = 0;
-        for b in &mut pattern {
-            *b = out[src + j];
-            j += 1;
-            if j == offset {
-                j = 0;
-            }
-        }
-        out[op..op + 16].copy_from_slice(&pattern);
-        let distance = 16usize.div_ceil(offset) * offset;
-        let mut d = op + 16;
-        while d < end {
-            out.copy_within(d - distance..d - distance + 16, d);
-            d += 16;
+        copy_match_short(out, op, offset, len);
+    }
+}
+
+/// [`copy_match`] for an offset under 16, which repeats a pattern, on aarch64: 16 bytes of the
+/// pattern laid out a byte at a time, inlined. [`copy_match_short`] is less work, but on Apple
+/// silicon any of it in or called from the sequence loop changes how the compiler builds the
+/// whole loop: 1 to 5% slower decoding for inputs with few short offsets out of line, 5 to
+/// 15% inlined.
+#[inline(always)]
+fn copy_match_short_inline(out: &mut [u8], op: usize, offset: usize, len: usize) {
+    let src = op - offset;
+    let end = op + len;
+    // Lay out 16 bytes of the pattern, then copy on from a distance that's a whole number of
+    // periods and at least 16.
+    let mut pattern = [0u8; 16];
+    let mut j = 0;
+    for b in &mut pattern {
+        *b = out[src + j];
+        j += 1;
+        if j == offset {
+            j = 0;
         }
     }
+    out[op..op + 16].copy_from_slice(&pattern);
+    let distance = 16usize.div_ceil(offset) * offset;
+    let mut d = op + 16;
+    while d < end {
+        out.copy_within(d - distance..d - distance + 16, d);
+        d += 16;
+    }
+}
+
+/// [`copy_match`] for an offset under 16, which repeats a pattern, everywhere but aarch64.
+/// Out of line and cold, so the sequence loop is built around the long-offset copy; inputs
+/// full of short offsets (a word list) still decode faster on x86-64 than with this inlined.
+#[cold]
+#[inline(never)]
+fn copy_match_short(out: &mut [u8], op: usize, offset: usize, len: usize) {
+    let src = op - offset;
+    let end = op + len;
+    // Lay out the pattern's first 8 bytes (a byte at a time when it's shorter), then copy on
+    // from a distance that's a whole number of periods: at least 8 for the next 8 bytes, at
+    // least 16 for the 16-byte chunks after.
+    if offset >= 8 {
+        out.copy_within(src..src + 8, op);
+    } else {
+        let w = &mut out[src..op + 8];
+        for i in 0..8 {
+            w[offset + i] = w[i];
+        }
+    }
+    if len <= 8 {
+        return;
+    }
+    let near = usize::from(PERIODS_8[offset]);
+    out.copy_within(op + 8 - near..op + 16 - near, op + 8);
+    let distance = usize::from(PERIODS_16[offset]);
+    let mut d = op + 16;
+    while d < end {
+        out.copy_within(d - distance..d - distance + 16, d);
+        d += 16;
+    }
+}
+
+/// For each offset under 16, the smallest whole number of its periods that is at least 8,
+/// and at least 16.
+const PERIODS_8: [u8; 16] = periods(8);
+const PERIODS_16: [u8; 16] = periods(16);
+
+const fn periods(at_least: usize) -> [u8; 16] {
+    let mut t = [0u8; 16];
+    let mut offset = 1;
+    while offset < 16 {
+        t[offset] = (at_least.div_ceil(offset) * offset) as u8;
+        offset += 1;
+    }
+    t
 }
 
 #[cfg(test)]
@@ -1034,6 +1101,19 @@ mod tests {
                 out.resize(history.len() + len + SLACK, 0);
                 copy_match(&mut out, history.len(), offset, len);
                 assert_eq!(out[..want.len()], want[..], "offset {offset}, length {len}");
+                // Both short-offset copies, whichever this target uses.
+                if offset < 16 {
+                    for inline in [false, true] {
+                        let mut out = history.clone();
+                        out.resize(history.len() + len + SLACK, 0);
+                        if inline {
+                            copy_match_short_inline(&mut out, history.len(), offset, len);
+                        } else {
+                            copy_match_short(&mut out, history.len(), offset, len);
+                        }
+                        assert_eq!(out[..want.len()], want[..], "offset {offset}, length {len}");
+                    }
+                }
             }
         }
     }
