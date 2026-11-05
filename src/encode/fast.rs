@@ -9,7 +9,7 @@ use std::ops::Range;
 
 use super::matcher::{MatchFinder, count_short, emit, hash_word, read32, read64};
 use super::params::{Params, Strategy};
-use super::seq::{Reps, SeqStore};
+use super::seq::{Reps, Seq, SeqStore};
 
 /// Bytes scanned without a match before the step grows by one.
 const STEP_INCREASE: usize = 128;
@@ -201,7 +201,17 @@ fn take<const MLS: u32>(
         c -= 1;
         len += 1;
     }
-    emit(src, s.anchor, a, a - c, len, reps, store);
+    // Coded as a new offset without looking at the repeat offsets, as the reference codes
+    // them: a hash match is seldom at one, and the comparisons cost more than the rare repeat
+    // code saves (the output comes out a little smaller, if anything).
+    let lit_len = (a - s.anchor) as u32;
+    store.push_lits(src, s.anchor, a);
+    let off_value = reps.new_offset((a - c) as u32);
+    store.push_seq(Seq {
+        lit_len,
+        match_len: len as u32,
+        off_value,
+    });
     after_match::<MLS>(s, ip, next, a + len, reps, store)
 }
 

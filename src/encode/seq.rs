@@ -85,6 +85,15 @@ impl Default for Reps {
 }
 
 impl Reps {
+    /// The offset value for a match at `offset` coded as a new offset, whatever the repeat
+    /// offsets are, and the history after it.
+    #[inline(always)]
+    pub(crate) fn new_offset(&mut self, offset: u32) -> u32 {
+        let r = &mut self.0;
+        *r = [offset, r[0], r[1]];
+        offset + 3
+    }
+
     /// The offset value for a match at `offset` after `lit_len` literals, using a repeat code
     /// when one fits, and the history after it.
     pub(crate) fn code(&mut self, offset: u32, lit_len: u32) -> u32 {

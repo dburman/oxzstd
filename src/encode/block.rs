@@ -40,6 +40,33 @@ fn flat(largest: u32, total: usize) -> bool {
     largest as usize <= (total >> 7) + 4
 }
 
+/// How often each byte occurs in `data`. The bytes go into four sets of counts in turn, so
+/// that a run of one byte doesn't make each increment wait on the one before it; a few
+/// hundred bytes go into one, which costs less than setting up and adding four. Not inlined:
+/// inlined, it moved the code around it and made compressing zeros 8% slower on x86.
+#[inline(never)]
+fn count_bytes(data: &[u8]) -> [u32; 256] {
+    if data.len() < 1024 {
+        let mut counts = [0u32; 256];
+        for &b in data {
+            counts[b as usize] += 1;
+        }
+        return counts;
+    }
+    let mut sets = [[0u32; 256]; 4];
+    let (quads, rest) = data.as_chunks::<4>();
+    for q in quads {
+        sets[0][q[0] as usize] += 1;
+        sets[1][q[1] as usize] += 1;
+        sets[2][q[2] as usize] += 1;
+        sets[3][q[3] as usize] += 1;
+    }
+    for &b in rest {
+        sets[0][b as usize] += 1;
+    }
+    std::array::from_fn(|i| sets[0][i] + sets[1][i] + sets[2][i] + sets[3][i])
+}
+
 /// Writes the literals section for `lits` (between `seqs` sequences), possibly updating the
 /// Huffman table in `entropy`.
 pub(crate) fn literals(lits: &[u8], seqs: usize, entropy: &mut Entropy, out: &mut Vec<u8>) {
@@ -64,10 +91,7 @@ pub(crate) fn literals(lits: &[u8], seqs: usize, entropy: &mut Entropy, out: &mu
             return;
         }
     }
-    let mut counts = [0u32; 256];
-    for &b in lits {
-        counts[b as usize] += 1;
-    }
+    let counts = count_bytes(lits);
     if flat(counts.iter().copied().max().unwrap_or(0), lits.len()) {
         raw(lits, out);
         return;
@@ -102,36 +126,40 @@ pub(crate) fn literals(lits: &[u8], seqs: usize, entropy: &mut Entropy, out: &mu
         return;
     }
     let four = lits.len() >= 256;
-    // Room for the streams as they're written (each in the worst case, 11 bits a literal).
-    let mut body = Vec::with_capacity(description.len() + lits.len() * 11 / 8 + 64);
     let used = if treeless {
         entropy.huffman.clone()
     } else {
-        body.extend_from_slice(&description);
         Some(code)
     };
     let Some(used) = used else {
         raw(lits, out);
         return;
     };
+    // Written in place after room for the header, whose size the literals' count decides (a
+    // body kept is shorter than the literals), so there's no buffer to set up and copy.
+    let header_len = match lits.len() {
+        0..=1023 => 3,
+        1024..=16383 => 4,
+        _ => 5,
+    };
+    let start = out.len();
+    out.extend_from_slice(&[0; 5][..header_len]);
+    if !treeless {
+        out.extend_from_slice(&description);
+    }
     let ok = if four {
-        used.encode_four(lits, &mut body).is_some()
+        used.encode_four(lits, out).is_some()
     } else {
-        used.encode_stream(lits, &mut body);
+        used.encode_stream(lits, out);
         true
     };
-    let header_len = if lits.len().max(body.len()) <= 1023 {
-        3
-    } else if lits.len().max(body.len()) <= 16383 {
-        4
-    } else {
-        5
-    };
+    let body_len = out.len() - start - header_len;
     if !ok
-        || body.len() + header_len + min_gain(lits.len()) >= lits.len()
-        || body.len() > 262_143
+        || body_len + header_len + min_gain(lits.len()) >= lits.len()
+        || body_len > 262_143
         || (!four && header_len != 3)
     {
+        out.truncate(start);
         raw(lits, out);
         return;
     }
@@ -142,9 +170,8 @@ pub(crate) fn literals(lits: &[u8], seqs: usize, entropy: &mut Entropy, out: &mu
         (true, 4) => (2, 14),
         _ => (3, 18),
     };
-    let h = kind | (format << 2) | ((lits.len() as u64) << 4) | ((body.len() as u64) << (4 + bits));
-    out.extend_from_slice(&h.to_le_bytes()[..header_len]);
-    out.extend_from_slice(&body);
+    let h = kind | (format << 2) | ((lits.len() as u64) << 4) | ((body_len as u64) << (4 + bits));
+    out[start..start + header_len].copy_from_slice(&h.to_le_bytes()[..header_len]);
     if !treeless {
         entropy.huffman = Some(used);
     }
@@ -312,7 +339,6 @@ pub(crate) fn sequences(
         return;
     }
     let coded = &mut scratch.coded;
-    coded.clear();
     let (ll_counts, of_counts, ml_counts) = code_and_count(seqs, coded);
     let ll = choose(&ll_counts, n, (&fse::LL_DEFAULT, 6), 9, entropy.ll.as_ref());
     let of = choose(&of_counts, n, (&fse::OF_DEFAULT, 5), 8, entropy.of.as_ref());
@@ -394,16 +420,18 @@ fn code_and_count(seqs: &[Seq], coded: &mut Vec<Coded>) -> ([u32; 36], [u32; 32]
         t[64 + (c.of as usize & 63)] += 1;
         t[128 + (c.ml as usize & 63)] += 1;
     };
-    coded.clear();
-    // Each overwritten below; any valid sequence will do to fill.
-    let filler = Coded::new(&Seq {
-        lit_len: 0,
-        match_len: 3,
-        off_value: 1,
-    });
-    coded.resize(seqs.len(), filler);
+    // Grown only, and filled only when it grows: each entry used is overwritten below, and
+    // any valid sequence will do to fill.
+    if coded.len() < seqs.len() {
+        let filler = Coded::new(&Seq {
+            lit_len: 0,
+            match_len: 3,
+            off_value: 1,
+        });
+        coded.resize(seqs.len(), filler);
+    }
     let (quads, rest) = seqs.as_chunks::<4>();
-    let (out_quads, out_rest) = coded.as_chunks_mut::<4>();
+    let (out_quads, out_rest) = coded[..seqs.len()].as_chunks_mut::<4>();
     for (q, out) in quads.iter().zip(out_quads) {
         for (set, (s, c)) in q.iter().zip(out).enumerate() {
             *c = Coded::new(s);
