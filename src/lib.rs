@@ -26,8 +26,9 @@ pub use decode::{decompress_into, decompress_partial, decompress_with_limit};
 pub use inspect::inspect;
 pub use xxhash::{Xxh64, xxh64};
 
-/// Why data couldn't be decompressed.
+/// Why data couldn't be decompressed. More reasons may be added, so a `match` needs a `_` arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The input ended in the middle of a frame.
     Truncated,

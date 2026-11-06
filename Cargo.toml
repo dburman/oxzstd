@@ -1,12 +1,26 @@
 [package]
 name = "oxzstd"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.95"
 description = "Zstandard (RFC 8878) compression and decompression in safe Rust, with no dependencies"
 license = "MIT"
 repository = "https://github.com/dburman/oxzstd"
-publish = false
+readme = "README.md"
+keywords = ["zstd", "zstandard", "compression", "decompression", "safe"]
+categories = ["compression"]
+# What a user of the crate needs: the code, its tests and examples, and the benchmark that
+# backs the README's claims. CI, lint and supply-chain configuration, the toolchain pin, the
+# scripts and the logo images stay in the repository.
+include = [
+    "/src",
+    "/tests",
+    "/examples",
+    "/benches",
+    "/docs/benchmarks.md",
+    "/README.md",
+    "/LICENSE",
+]
 
 # Its own workspace, also when checked out inside another one (as a submodule, say).
 [workspace]

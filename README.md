@@ -1,14 +1,14 @@
 <h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
-    <img src="docs/assets/logo-light.png" alt="oxzstd" width="220">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/dburman/oxzstd/main/docs/assets/logo-dark.png">
+    <img src="https://raw.githubusercontent.com/dburman/oxzstd/main/docs/assets/logo-light.png" alt="oxzstd" width="220">
   </picture>
 </h1>
 
 **oxzstd is a Rust library that compresses and decompresses data in the Zstandard format**,
 written entirely in safe Rust, with no dependencies and no C code.
 
-[Zstandard](https://facebook.github.io/zstd/) (zstd, RFC 8878) is a widely used compression
+[Zstandard](https://github.com/meta/zstd) (zstd, RFC 8878) is a widely used compression
 format: it compresses about as well as gzip or better while running several times faster,
 and it's used for `.zst` files, web traffic (`Content-Encoding: zstd`), package archives,
 file systems, databases and backups. The usual way to use it from Rust is to bind the reference
@@ -27,16 +27,14 @@ C library. oxzstd is a complete implementation of its own instead:
 - **No dependencies and no C:** no C compiler or `cmake` in the build, nothing to
   cross-compile but Rust, and nothing else to audit.
 
-**Status:** in development. The format support and compression are complete (except
-dictionaries), but the API may still change before a first release.
+**Status:** 0.1. The format support and compression are complete (except dictionaries); the
+API may still change between 0.x releases. Needs Rust 1.95 or later.
 
 ## Use
 
-oxzstd isn't on crates.io yet. Add it from Git:
-
 ```toml
 [dependencies]
-oxzstd = { git = "https://github.com/dburman/oxzstd" }
+oxzstd = "0.1"
 ```
 
 Compress and decompress in one call:

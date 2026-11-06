@@ -3,6 +3,7 @@
 
 /// How matches are searched for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum Strategy {
     /// One hash table, one candidate per position.
     Fast,
@@ -24,8 +25,10 @@ pub enum Strategy {
     BtUltra2,
 }
 
-/// The parameters of one level.
+/// The parameters of one level, for reading: [`Params::for_level`] gives them. More may be
+/// added.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Params {
     /// Log2 of the window (the farthest a match may reach back).
     pub window_log: u32,
