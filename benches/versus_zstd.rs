@@ -1,9 +1,11 @@
 //! Ratio and speed against the reference `zstd` tool, level by level.
 //!
-//! `cargo bench --bench versus_zstd -- [levels] [names]`: levels like `1,3,19` or `1-9`
-//! (default 1-19), names filter the corpus. Files in `bench-data/` are added to the corpus.
-//! The reference is timed with its own in-memory benchmark (`zstd -b`), oxzstd with the best
-//! of several runs.
+//! `cargo bench --bench versus_zstd -- [--rounds=N] [levels] [names]`: levels like `1,3,19`
+//! or `1-9` (default 1-19), names filter the corpus. Files in `bench-data/` are added to the
+//! corpus. The reference is timed with its own in-memory benchmark (`zstd -b`), oxzstd with
+//! the best of several runs. Each measurement takes `N` rounds (default 3), oxzstd and the
+//! reference in turn so that both see the same changes in the machine's speed, and reports
+//! the median of each.
 
 #![allow(
     clippy::unwrap_used,
@@ -79,7 +81,85 @@ fn reference(path: &std::path::Path, level: i32) -> Option<(usize, f64, f64)> {
     Some((size, *speeds.first()?, *speeds.get(1)?))
 }
 
+/// The median of `v` (not empty).
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        f64::midpoint(v[n / 2 - 1], v[n / 2])
+    }
+}
+
+/// A speed in MB/s to three significant digits (whole numbers from 100).
+fn speed(v: f64) -> String {
+    if v >= 100.0 {
+        format!("{v:.0}")
+    } else if v >= 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// Measures oxzstd and the reference on `data` (also at `path`) at `level`, and prints a line
+/// of the report: sizes, then speeds in MB/s and oxzstd's as a percentage of the reference's.
+fn measure(name: &str, data: &[u8], path: &std::path::Path, level: i32, rounds: usize) {
+    let mb = data.len() as f64 / 1e6;
+    let budget = Duration::from_millis(if level >= 16 { 300 } else { 500 });
+    // No checksum, like the reference's benchmark frames, and contexts and buffers reused
+    // from run to run, as its benchmark does.
+    let options = oxzstd::Options::new(level).checksum(false);
+    let mut compressor = oxzstd::Compressor::new(options);
+    let mut decompressor = oxzstd::Decompressor::new();
+    let (mut frame, mut buf) = (Vec::new(), Vec::new());
+    let mut zsize = 0;
+    let [mut oc, mut od, mut zc, mut zd] = [(); 4].map(|()| Vec::new());
+    for _ in 0..rounds {
+        let (ct, ()) = best(budget, || {
+            frame.clear();
+            compressor.compress_into(data, &mut frame);
+        });
+        let (dt, ()) = best(budget, || {
+            buf.clear();
+            decompressor
+                .decompress_into(&frame, &mut buf, usize::MAX)
+                .unwrap();
+        });
+        assert!(buf == data, "{name} at level {level} doesn't round-trip");
+        oc.push(mb / ct.as_secs_f64());
+        od.push(mb / dt.as_secs_f64());
+        let Some((size, c, d)) = reference(path, level) else {
+            println!("{name:<14} {level:>5}: the reference benchmark failed");
+            return;
+        };
+        zsize = size;
+        zc.push(c);
+        zd.push(d);
+    }
+    let [oc, od, zc, zd] = [oc, od, zc, zd].map(|mut v| median(&mut v));
+    println!(
+        "{:<14} {:>5} {:>10} {:>10} {:>+6.2}% {:>8} {:>8} {:>4.0}% {:>8} {:>8} {:>4.0}%",
+        name,
+        level,
+        frame.len(),
+        zsize,
+        (frame.len() as f64 / zsize as f64 - 1.0) * 100.0,
+        speed(oc),
+        speed(zc),
+        oc / zc * 100.0,
+        speed(od),
+        speed(zd),
+        od / zd * 100.0,
+    );
+}
+
 fn main() {
+    let rounds: usize = std::env::args()
+        .find_map(|a| a.strip_prefix("--rounds=").map(|n| n.parse().unwrap()))
+        .unwrap_or(3)
+        .max(1);
     let args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| !a.starts_with("--"))
@@ -110,8 +190,18 @@ fn main() {
         }
     }
     println!(
-        "{:<14} {:>5} {:>10} {:>10} {:>7} {:>9} {:>9} {:>9} {:>9}",
-        "input", "level", "oxzstd", "zstd", "size", "ox comp", "zs comp", "ox dec", "zs dec"
+        "{:<14} {:>5} {:>10} {:>10} {:>7} {:>8} {:>8} {:>5} {:>8} {:>8} {:>5}",
+        "input",
+        "level",
+        "oxzstd",
+        "zstd",
+        "size",
+        "ox comp",
+        "zs comp",
+        "comp",
+        "ox dec",
+        "zs dec",
+        "dec"
     );
     for (name, data) in &corpus {
         if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
@@ -119,44 +209,8 @@ fn main() {
         }
         let path = dir.join(name);
         std::fs::write(&path, data).unwrap();
-        let mb = data.len() as f64 / 1e6;
         for &level in &levels {
-            let budget = Duration::from_millis(if level >= 16 { 300 } else { 600 });
-            // No checksum, like the reference's benchmark frames, and contexts and buffers
-            // reused from run to run, as its benchmark does.
-            let options = oxzstd::Options::new(level).checksum(false);
-            let mut compressor = oxzstd::Compressor::new(options);
-            let mut frame = Vec::new();
-            let (ct, ()) = best(budget, || {
-                frame.clear();
-                compressor.compress_into(data, &mut frame);
-            });
-            let mut decompressor = oxzstd::Decompressor::new();
-            let mut buf = Vec::new();
-            let (dt, ()) = best(budget, || {
-                buf.clear();
-                decompressor
-                    .decompress_into(&frame, &mut buf, usize::MAX)
-                    .unwrap();
-            });
-            let back = buf;
-            assert!(back == *data, "{name} at level {level} doesn't round-trip");
-            let Some((zsize, zc, zd)) = reference(&path, level) else {
-                println!("{name:<14} {level:>5}: the reference benchmark failed");
-                continue;
-            };
-            println!(
-                "{:<14} {:>5} {:>10} {:>10} {:>+6.2}% {:>7.0}MB {:>7.0}MB {:>7.0}MB {:>7.0}MB",
-                name,
-                level,
-                frame.len(),
-                zsize,
-                (frame.len() as f64 / zsize as f64 - 1.0) * 100.0,
-                mb / ct.as_secs_f64(),
-                zc,
-                mb / dt.as_secs_f64(),
-                zd,
-            );
+            measure(name, data, &path, level, rounds);
         }
     }
     drop(std::fs::remove_dir_all(&dir));

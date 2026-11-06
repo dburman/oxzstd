@@ -199,40 +199,45 @@ impl<const MLS: u32> Search for HashChain<MLS> {
 }
 
 /// The longest match found so far at a position.
-struct Best {
+struct Best<'a> {
     /// One less than the shortest match worth having next.
     ml: usize,
     found: Option<(usize, usize)>,
     /// The 4 bytes such a match has to end with: those at `ip + ml - 3`, read once for all
     /// the candidates rather than for each.
     tail: u32,
+    /// The input from `ml - 3` on, where a candidate's 4 bytes to compare with `tail` start
+    /// at its own position. (Read at `m + ml - 3` in the whole input, the sum needs checking
+    /// for wrapping round; here, at a position from the tables, it can't.)
+    shifted: &'a [u8],
 }
 
-impl Best {
-    fn new(src: &[u8], ip: usize) -> Self {
+impl<'a> Best<'a> {
+    fn new(src: &'a [u8], ip: usize) -> Self {
         Self {
             ml: 3,
             found: None,
             tail: read32(src, ip),
+            shifted: src,
         }
     }
 
     /// Measures the candidate `m` for `ip`; returns whether the match reaches `end`, so no
     /// longer one is possible.
     #[inline(always)]
-    fn try_candidate(&mut self, src: &[u8], ip: usize, m: usize, end: usize) -> bool {
+    fn try_candidate(&mut self, src: &'a [u8], ip: usize, m: usize, end: usize) -> bool {
         // Only a match longer than the best so far is worth counting: check the 4 bytes that
         // end where it would have to reach.
-        let ml = self.ml;
-        if read32(src, m + ml - 3) == self.tail {
+        if read32(self.shifted, m) == self.tail {
             let len = count(src, ip, m, end);
-            if len > ml {
+            if len > self.ml {
                 self.ml = len;
                 self.found = Some((len, ip - m));
                 if ip + len == end {
                     return true;
                 }
                 self.tail = read32(src, ip + len - 3);
+                self.shifted = &src[len - 3..];
             }
         }
         false
@@ -250,7 +255,6 @@ pub(crate) struct Row<const MLS: u32, const ROW_LOG: u32> {
     tags: Vec<u8>,
     /// Bits of the hash that pick the row; 8 more make the tag.
     hash_bits: u32,
-    attempts: usize,
     window: usize,
     /// The first position not yet entered into the rows.
     next_to_update: usize,
@@ -271,11 +275,14 @@ impl<const MLS: u32, const ROW_LOG: u32> Row<MLS, ROW_LOG> {
     }
 
     pub(crate) fn new(p: &Params) -> Self {
+        // The reference tries `1 << min(searchLog, rowLog)` candidates; rows are used from
+        // searchLog 4 (as many as the smallest row), so that's always the whole row, and a
+        // search needs no count of its own.
+        debug_assert!(p.search_log >= ROW_LOG);
         Self {
             table: vec![0; 1 << p.hash_log],
             tags: vec![0; 1 << p.hash_log],
             hash_bits: p.hash_log - ROW_LOG,
-            attempts: 1 << p.search_log.min(ROW_LOG),
             window: 1 << p.window_log,
             next_to_update: 0,
         }
@@ -324,9 +331,21 @@ impl<const MLS: u32, const ROW_LOG: u32> Row<MLS, ROW_LOG> {
     }
 }
 
-/// Which of the `tags` equal `tag`, as a bit per tag (the low bit for the first).
-#[inline]
+/// Which of the `tags` (16, 32 or 64) equal `tag`, as a bit per tag (the low bit for the
+/// first).
+#[inline(always)]
 fn match_mask(tags: &[u8], tag: u8) -> u64 {
+    if tags.len() > 16 {
+        match_mask_wide(tags, tag)
+    } else {
+        match_mask_narrow(tags, tag)
+    }
+}
+
+/// [`match_mask`] in general registers, 8 tags at a time: for 16 tags, faster than the vector
+/// compare, whose result takes a while to reach a general register on aarch64.
+#[inline(always)]
+fn match_mask_narrow(tags: &[u8], tag: u8) -> u64 {
     const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
     let splat = u64::from(tag) * 0x0101_0101_0101_0101;
     let mut mask = 0;
@@ -337,6 +356,23 @@ fn match_mask(tags: &[u8], tag: u8) -> u64 {
         // Gather those 8 bits into one byte.
         let bits = ((zero >> 7).wrapping_mul(0x0102_0408_1020_4080)) >> 56;
         mask |= bits << (8 * i);
+    }
+    mask
+}
+
+/// [`match_mask`] 16 tags at a time, as a plain loop that the compiler makes into a vector
+/// compare and a gather of its results (`pcmpeqb` and `pmovmskb` on x86-64, `cmeq` and
+/// `addp` on aarch64). Out of line: inlined, the compiler widens it into something far
+/// longer.
+#[inline(never)]
+fn match_mask_wide(tags: &[u8], tag: u8) -> u64 {
+    let mut mask = 0;
+    for (i, chunk) in tags.as_chunks::<16>().0.iter().enumerate() {
+        let mut bits = 0u16;
+        for (j, &t) in chunk.iter().enumerate() {
+            bits |= u16::from(t == tag) << j;
+        }
+        mask |= u64::from(bits) << (16 * i);
     }
     mask
 }
@@ -363,9 +399,14 @@ impl<const MLS: u32, const ROW_LOG: u32> Search for Row<MLS, ROW_LOG> {
         let low = (ip + 1).saturating_sub(self.window).max(1);
         let (row, tag) = self.locate(src, ip);
         let (entries, mask) = (Self::ENTRIES, Self::MASK);
-        let head = usize::from(self.tags[row]) & mask;
+        // Sliced once, so an entry picked by a masked slot needs no check.
+        let (tags, positions) = (
+            &self.tags[row..row + entries],
+            &self.table[row..row + entries],
+        );
+        let head = usize::from(tags[0]) & mask;
         // The first tag byte is the head, not a tag.
-        let matches = match_mask(&self.tags[row..row + entries], tag) & !1;
+        let matches = match_mask(tags, tag) & !1;
         // Newest first: the head's entry, then the ones written before it.
         let full = if entries == 64 {
             u64::MAX
@@ -377,17 +418,16 @@ impl<const MLS: u32, const ROW_LOG: u32> Search for Row<MLS, ROW_LOG> {
         } else {
             ((matches >> head) | (matches << (entries - head))) & full
         };
-        // Each candidate measured as it's found (nothing here writes the row).
+        // Each candidate measured as it's found (nothing here writes the row). A row holds
+        // fewer than a search may try, so only the row bounds the search: see `new`.
         let mut best = Best::new(src, ip);
-        let mut found = 0;
-        while matches != 0 && found < self.attempts {
+        while matches != 0 {
             let slot = (head + matches.trailing_zeros() as usize) & mask;
             matches &= matches - 1;
-            let index = self.table[row + slot] as usize;
+            let index = positions[slot] as usize;
             if index < low {
                 break;
             }
-            found += 1;
             if best.try_candidate(src, ip, index - 1, end) {
                 break;
             }
@@ -517,15 +557,22 @@ mod tests {
     #[test]
     fn tag_masks_mark_exactly_the_equal_bytes() {
         let tags: Vec<u8> = (0..64u32).map(|i| (i * 37 % 7) as u8).collect();
-        for tag in 0..8u8 {
-            let mask = match_mask(&tags, tag);
-            for (i, &t) in tags.iter().enumerate() {
-                assert_eq!(mask >> i & 1 == 1, t == tag, "tag {tag} at {i}");
+        for len in [16, 32, 64] {
+            let tags = &tags[..len];
+            for tag in 0..8u8 {
+                let mask = match_mask(tags, tag);
+                assert_eq!(mask >> (len - 1) >> 1, 0, "bits past {len}");
+                for (i, &t) in tags.iter().enumerate() {
+                    assert_eq!(mask >> i & 1 == 1, t == tag, "tag {tag} at {i} of {len}");
+                }
+                assert_eq!(match_mask_narrow(tags, tag), match_mask_wide(tags, tag));
             }
         }
         // Bytes next to a match, and 0x80 and 0xFF, aren't mistaken for one.
-        let tricky = [0u8, 1, 0x80, 0xFF, 0, 0x7F, 0x81, 0];
-        assert_eq!(match_mask(&tricky, 0), 0b1001_0001);
-        assert_eq!(match_mask(&tricky, 0x80), 0b0000_0100);
+        let tricky = [0u8, 1, 0x80, 0xFF, 0, 0x7F, 0x81, 0].repeat(2);
+        for f in [match_mask_narrow, match_mask_wide] {
+            assert_eq!(f(&tricky, 0), 0b1001_0001_1001_0001);
+            assert_eq!(f(&tricky, 0x80), 0b0000_0100_0000_0100);
+        }
     }
 }
