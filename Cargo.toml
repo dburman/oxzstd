@@ -20,6 +20,7 @@ include = [
     "/docs/benchmarks.md",
     "/README.md",
     "/LICENSE",
+    "/NOTICE",
 ]
 
 # Its own workspace, also when checked out inside another one (as a submodule, say).

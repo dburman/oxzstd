@@ -106,4 +106,6 @@ cargo deny check
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The code tables and predefined distributions come from RFC 8878,
+and some numeric settings match the reference implementation's: both are credited, with their
+licenses, in [NOTICE](NOTICE).
